@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: moov-image
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/moovfinancial/cloud-spanner-emulator
@@ -33,6 +33,12 @@ jobs:
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
+
+      # The generated GoogleSQL sources need several GB each in GCC. Four at
+      # once runs the 16 GB hosted runner out of memory.
+      - name: Limit Bazel parallelism
+        if: matrix.platform == 'linux/arm64'
+        run: echo 'build --jobs=2' >> .bazelrc
 
       # Anonymous Docker Hub pulls hit 429s on shared runners.
       - uses: docker/setup-buildx-action@v3
