@@ -6,6 +6,8 @@ name: Moov image
 on:
   push:
     branches: [moov]
+    # Workflow-only commits do not change the image.
+    paths-ignore: [".github/**"]
   workflow_dispatch:
 
 permissions:

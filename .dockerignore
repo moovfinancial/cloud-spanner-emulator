@@ -10,3 +10,4 @@ build/kokoro/
 copybara
 METADATA
 OWNERS*
+.github
