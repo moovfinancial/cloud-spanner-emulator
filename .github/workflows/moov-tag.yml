@@ -1,6 +1,7 @@
 # Tags images that a "Moov image" run already pushed by digest, without a
 # rebuild. Use it when one platform build failed and another succeeded, or to
 # re-point a tag. digests: space-separated sha256 hex values, one per platform.
+# source: the registry the digests are in; the result is always in GAR.
 name: Moov tag
 
 on:
@@ -12,19 +13,37 @@ on:
       tag:
         description: Extra tag besides latest, for example 1.5.58-moov-ba3189a3
         required: true
+      source:
+        description: Image the digests belong to
+        required: true
+        default: us-docker.pkg.dev/moov-gar/apps/cloud-spanner-emulator
 
 permissions:
   contents: read
-  packages: write
+  id-token: write
+  packages: read
 
 env:
-  IMAGE: ghcr.io/moovfinancial/cloud-spanner-emulator
+  IMAGE: us-docker.pkg.dev/moov-gar/apps/cloud-spanner-emulator
 
 jobs:
   tag:
     runs-on: ubuntu-24.04
     steps:
       - uses: docker/setup-buildx-action@v3
+
+      - id: gcp_auth
+        uses: google-github-actions/auth@v3
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ vars.GCP_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: us-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.gcp_auth.outputs.access_token }}
 
       - uses: docker/login-action@v3
         with:
@@ -36,8 +55,9 @@ jobs:
         env:
           DIGESTS: ${{ inputs.digests }}
           TAG: ${{ inputs.tag }}
+          SOURCE: ${{ inputs.source }}
         run: |
           refs=""
-          for d in $DIGESTS; do refs="$refs $IMAGE@sha256:${d#sha256:}"; done
+          for d in $DIGESTS; do refs="$refs $SOURCE@sha256:${d#sha256:}"; done
           docker buildx imagetools create -t "$IMAGE:$TAG" -t "$IMAGE:latest" $refs
           docker buildx imagetools inspect "$IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"
