@@ -5,6 +5,9 @@ name: Moov perf image
 on:
   push:
     branches: ["perf/**"]
+  # A pull request into moov can restore the layer cache of moov image builds.
+  pull_request:
+    branches: [moov]
   workflow_dispatch:
 
 permissions:
@@ -20,7 +23,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest-8-cores
+    runs-on: ubuntu-24.04
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
