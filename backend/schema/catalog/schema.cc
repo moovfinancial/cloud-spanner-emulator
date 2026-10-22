@@ -738,6 +738,12 @@ Schema::Schema(const SchemaGraph* graph,
   locality_groups_.clear();
   locality_groups_map_.clear();
   for (const SchemaNode* node : graph_->GetSchemaNodes()) {
+    // Most nodes are columns, which the schema does not index. Skip them
+    // before the casts to every other node type.
+    if (node->As<const Column>() != nullptr ||
+        node->As<const KeyColumn>() != nullptr) {
+      continue;
+    }
     const View* view = node->As<const View>();
     if (view != nullptr) {
       views_.push_back(view);
