@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -77,6 +78,7 @@
 #include "backend/query/feature_filter/query_size_limits_checker.h"
 #include "backend/query/function_catalog.h"
 #include "backend/query/hint_rewriter.h"
+#include "backend/query/join_lookup_rewriter.h"
 #include "backend/query/index_hint_validator.h"
 #include "backend/query/insert_on_conflict_dml_execution.h"
 #include "backend/query/partitionability_validator.h"
@@ -999,6 +1001,16 @@ absl::StatusOr<std::unique_ptr<RowCursor>> EvaluateQuery(
   }
   GOOGLESQL_RET_CHECK_EQ(resolved_statement->node_kind(), googlesql::RESOLVED_QUERY_STMT)
       << "input is not a query statement";
+
+  // Joins by key with a narrowed left input read the right table per left row.
+  std::unique_ptr<googlesql::ResolvedStatement> rewritten;
+  if (std::getenv("SPANNER_EMULATOR_DISABLE_JOIN_LOOKUP") == nullptr) {
+    JoinLookupRewriter join_rewriter;
+    GOOGLESQL_RETURN_IF_ERROR(resolved_statement->Accept(&join_rewriter));
+    GOOGLESQL_ASSIGN_OR_RETURN(
+        rewritten, join_rewriter.ConsumeRootNode<googlesql::ResolvedStatement>());
+    resolved_statement = rewritten.get();
+  }
 
   auto prepared_query = std::make_unique<googlesql::PreparedQuery>(
       resolved_statement->GetAs<googlesql::ResolvedQueryStmt>(),
