@@ -67,6 +67,9 @@ class SchemaGraphEditor {
         context_(context),
         cloned_pool_(std::make_unique<SchemaObjectsPool>()) {
     context_->set_added_nodes(&added_nodes_);
+    for (const SchemaNode* node : original_graph_->GetSchemaNodes()) {
+      original_nodes_.insert(node);
+    }
   }
 
   template <typename T>
@@ -276,6 +279,10 @@ class SchemaGraphEditor {
 
   // The original graph.
   const SchemaGraph* original_graph_ = nullptr;
+
+  // The nodes of the original graph, so a node is looked up in constant time
+  // and not by a scan of the whole schema per node cloned.
+  absl::flat_hash_set<const SchemaNode*> original_nodes_;
 
   // Validation context passed to Validate() and ValidateUpdate() methods for
   // SchemaNode.
