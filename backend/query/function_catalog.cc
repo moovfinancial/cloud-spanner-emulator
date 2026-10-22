@@ -44,6 +44,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/strings/strip.h"
 #include "absl/strings/substitute.h"
 #include "absl/types/span.h"
@@ -571,6 +572,44 @@ std::unique_ptr<googlesql::Function> SecureContextFunction(
       options);
 }
 }  // namespace
+
+namespace {
+
+absl::Mutex pooled_catalogs_mu(absl::kConstInit);
+
+std::vector<FunctionCatalog*>& PooledCatalogs() {
+  static auto* catalogs = new std::vector<FunctionCatalog*>();
+  return *catalogs;
+}
+
+googlesql::TypeFactory* PooledCatalogTypeFactory() {
+  static auto* type_factory = new googlesql::TypeFactory();
+  return type_factory;
+}
+
+}  // namespace
+
+PooledFunctionCatalog::PooledFunctionCatalog(
+    const backend::Schema* latest_schema) {
+  catalog_ = nullptr;
+  {
+    absl::MutexLock lock(pooled_catalogs_mu);
+    if (!PooledCatalogs().empty()) {
+      catalog_ = PooledCatalogs().back();
+      PooledCatalogs().pop_back();
+    }
+  }
+  if (catalog_ == nullptr) {
+    catalog_ = new FunctionCatalog(PooledCatalogTypeFactory());
+  }
+  catalog_->SetLatestSchema(latest_schema);
+}
+
+PooledFunctionCatalog::~PooledFunctionCatalog() {
+  catalog_->SetLatestSchema(nullptr);
+  absl::MutexLock lock(pooled_catalogs_mu);
+  PooledCatalogs().push_back(catalog_);
+}
 
 FunctionCatalog::FunctionCatalog(googlesql::TypeFactory* type_factory,
                                  const std::string& catalog_name,

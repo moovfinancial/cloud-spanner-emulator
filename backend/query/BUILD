@@ -858,6 +858,7 @@ cc_library(
         "function_catalog.h",
     ],
     deps = [
+        "@com_google_absl//absl/synchronization",
         ":column_expression_analysis_cache",
         ":analyzer_options",
         "//backend/common:case",
