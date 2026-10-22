@@ -90,6 +90,7 @@ using googlesql::values::Date;
 using googlesql::values::Enum;
 using googlesql::values::Int64;
 using googlesql::values::NullInt64;
+using googlesql::values::NullString;
 using googlesql::values::NullTimestamp;
 using googlesql::values::Numeric;
 using googlesql::values::Proto;
@@ -1183,6 +1184,33 @@ TEST_P(QueryEngineTest,
                                                 ElementsAre(String("four")))));
 }
 
+TEST_P(QueryEngineTest, JoinByKeyWithANarrowedLeftInputFindsItsRows) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(
+          Query{"SELECT a.int64_col, b.string_col FROM test_table a "
+                "JOIN test_table b ON b.int64_col = a.int64_col "
+                "WHERE a.int64_col = 2"},
+          QueryContext{schema(), reader()}));
+  EXPECT_THAT(GetAllColumnValues(std::move(result.rows)),
+              IsOkAndHolds(ElementsAre(ElementsAre(Int64(2), String("two")))));
+}
+
+TEST_P(QueryEngineTest, LeftJoinByKeyKeepsLeftRowsWithoutAMatch) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(
+          Query{"SELECT a.int64_col, b.string_col FROM test_table a "
+                "LEFT JOIN test_table b ON b.int64_col = a.int64_col "
+                "AND b.string_col = 'none' WHERE a.int64_col IN (1, 2)"},
+          QueryContext{schema(), reader()}));
+  EXPECT_THAT(
+      GetAllColumnValues(std::move(result.rows)),
+      IsOkAndHolds(UnorderedElementsAre(
+          ElementsAre(Int64(1), NullString()),
+          ElementsAre(Int64(2), NullString()))));
+}
+
 TEST_P(QueryEngineTest, ExecuteSqlSelectsAllColumnsFromTable) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(
       QueryResult result,
@@ -1709,6 +1737,53 @@ TEST_P(QueryEngineTest, CanInsertZeroRowsWithSelectStatement) {
           QueryContext{schema(), reader(), &writer}));
   EXPECT_EQ(result.rows, nullptr);
   EXPECT_EQ(result.modified_row_count, 0);
+}
+
+TEST_P(QueryEngineTest, UpdateByKeyModifiesOnlyTheMatchingRow) {
+  MockRowWriter writer;
+  EXPECT_CALL(writer,
+              Write(Property(
+                  &Mutation::ops,
+                  UnorderedElementsAre(AllOf(
+                      Field(&MutationOp::type, MutationOpType::kUpdate),
+                      Field(&MutationOp::rows,
+                            UnorderedElementsAre(ValueList{
+                                Int64(2), String("updated")})))))))
+      .Times(1)
+      .WillOnce(Return(absl::OkStatus()));
+  std::string sql =
+      "UPDATE test_table SET string_col = 'updated' "
+      "WHERE int64_col = 2 AND string_col = 'two'";
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(Query{sql},
+                                QueryContext{schema(), reader(), &writer}));
+  EXPECT_EQ(result.modified_row_count, 1);
+}
+
+TEST_P(QueryEngineTest, UpdateThatReadsItsTableTwiceSeesEveryRow) {
+  if (GetParam() == POSTGRESQL) {
+    GTEST_SKIP() << "The subquery uses GoogleSQL casts.";
+  }
+  MockRowWriter writer;
+  EXPECT_CALL(writer,
+              Write(Property(
+                  &Mutation::ops,
+                  UnorderedElementsAre(AllOf(
+                      Field(&MutationOp::type, MutationOpType::kUpdate),
+                      Field(&MutationOp::rows,
+                            UnorderedElementsAre(ValueList{
+                                Int64(1), String("3")})))))))
+      .Times(1)
+      .WillOnce(Return(absl::OkStatus()));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(
+          Query{"UPDATE test_table SET string_col = "
+                "(SELECT CAST(COUNT(*) AS STRING) FROM test_table) "
+                "WHERE int64_col = 1"},
+          QueryContext{schema(), reader(), &writer}));
+  EXPECT_EQ(result.modified_row_count, 1);
 }
 
 TEST_P(QueryEngineTest, ConnotUpdatePrimaryKey) {
@@ -2400,6 +2475,15 @@ TEST_P(QueryEngineTest, TestGetEmptyChangeStreamMetadataFromNormalQuery) {
   Query query{"SELECT * FROM test_table"};
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto metadata, query_engine().TryGetChangeStreamMetadata(
                                           query, change_stream_schema()));
+  ASSERT_FALSE(metadata.is_change_stream_query);
+}
+
+TEST_P(QueryEngineTest, TestSkipChangeStreamAnalysisWithoutChangeStreams) {
+  // Without change streams the statement is not analyzed here, so even an
+  // invalid one returns empty metadata; ExecuteSql reports the error.
+  Query query{"SELECT * FROM no_such_table"};
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto metadata,
+                       query_engine().TryGetChangeStreamMetadata(query, schema()));
   ASSERT_FALSE(metadata.is_change_stream_query);
 }
 

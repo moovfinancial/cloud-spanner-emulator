@@ -50,6 +50,7 @@
 #include "backend/query/column_expression_analysis_cache.h"
 #include "backend/query/queryable_column.h"
 #include "backend/schema/catalog/column.h"
+#include "backend/schema/catalog/index.h"
 #include "common/constants.h"
 #include "common/feature_flags.h"
 #include "googlesql/base/ret_check.h"
@@ -132,21 +133,26 @@ bool KeyFilterPushdownEnabled() {
 // that the filters the evaluator offers before then can narrow the read from
 // the whole table to the keys that can match.
 //
-// Only equality and IN filters on the leading primary key columns are used.
-// The evaluator applies every filter again to the rows it is given, so a filter
-// left unused costs a wider read and never a wrong result.
+// Only equality and IN filters are used, on the leading primary key columns or
+// the leading key columns of an index. The evaluator applies every filter again
+// to the rows it is given, so a filter left unused costs a wider read and never
+// a wrong result.
 class KeyFilteredTableIterator : public googlesql::EvaluatorTableIterator {
  public:
-  // 'leading_key_positions' holds, for the primary key columns in key order up
-  // to the first one the scan does not read, the position of that column among
-  // the columns of 'read_arg'.
-  KeyFilteredTableIterator(RowReader* reader, ReadArg read_arg,
+  // 'column_idxs' holds the table column index of each column of 'read_arg'.
+  // 'dml_values', if set, narrows the read the same way as offered filters:
+  // statements that modify rows do not offer their WHERE clause.
+  KeyFilteredTableIterator(const QueryableTable* table, RowReader* reader,
+                           ReadArg read_arg,
                            std::vector<const googlesql::Type*> column_types,
-                           std::vector<int> leading_key_positions)
-      : reader_(reader),
+                           std::vector<int> column_idxs,
+                           std::optional<ColumnValues> dml_values)
+      : table_(table),
+        reader_(reader),
         read_arg_(std::move(read_arg)),
         column_types_(std::move(column_types)),
-        leading_key_positions_(std::move(leading_key_positions)) {}
+        column_idxs_(std::move(column_idxs)),
+        dml_values_(std::move(dml_values)) {}
 
   int NumColumns() const override {
     return static_cast<int>(read_arg_.columns.size());
@@ -166,55 +172,21 @@ class KeyFilteredTableIterator : public googlesql::EvaluatorTableIterator {
     if (rows_ != nullptr) {
       return absl::OkStatus();
     }
-    std::vector<Key> prefixes = {Key()};
-    int narrowed_columns = 0;
-    for (int position : leading_key_positions_) {
-      auto filter = filter_map.find(position);
-      if (filter == filter_map.end() ||
-          filter->second->kind() != googlesql::ColumnFilter::kInList) {
-        break;
+    ColumnValues values;
+    for (const auto& [position, filter] : filter_map) {
+      if (filter->kind() == googlesql::ColumnFilter::kInList) {
+        values[column_idxs_[position]] = filter->in_list();
       }
-      const std::vector<googlesql::Value>& wanted = filter->second->in_list();
-      const googlesql::Type* column_type = column_types_[position];
-      // Only for types whose SQL equality is the equality of their key values,
-      // and only for values of the column's own type: anything else is left to
-      // the evaluator.
-      if (!(column_type->IsInt64() || column_type->IsString() ||
-            column_type->IsBytes() || column_type->IsBool() ||
-            column_type->IsDate() || column_type->IsTimestamp()) ||
-          !std::all_of(wanted.begin(), wanted.end(),
-                       [column_type](const googlesql::Value& value) {
-                         return value.type()->Equals(column_type);
-                       }) ||
-          prefixes.size() * wanted.size() > kMaxKeysFromFilters) {
-        break;
-      }
-      std::vector<Key> extended;
-      extended.reserve(prefixes.size() * wanted.size());
-      for (const Key& prefix : prefixes) {
-        for (const googlesql::Value& value : wanted) {
-          Key key = prefix;
-          key.AddColumn(value);
-          extended.push_back(std::move(key));
-        }
-      }
-      prefixes = std::move(extended);
-      ++narrowed_columns;
     }
-    if (narrowed_columns == 0) {
-      return absl::OkStatus();
-    }
-    // An empty list is a filter no row passes, and leaves an empty key set.
-    KeySet key_set;
-    for (const Key& prefix : prefixes) {
-      key_set.AddRange(KeyRange::Prefix(prefix));
-    }
-    read_arg_.key_set = key_set;
+    Narrow(values);
     return absl::OkStatus();
   }
 
   bool NextRow() override {
     if (rows_ == nullptr) {
+      if (dml_values_.has_value()) {
+        Narrow(*dml_values_);
+      }
       std::unique_ptr<RowCursor> cursor;
       read_status_ = reader_->Read(read_arg_, &cursor);
       if (!read_status_.ok()) {
@@ -238,6 +210,20 @@ class KeyFilteredTableIterator : public googlesql::EvaluatorTableIterator {
   absl::Status Cancel() override { return absl::OkStatus(); }
 
  private:
+  void Narrow(const ColumnValues& values) {
+    if (values.empty()) {
+      return;
+    }
+    // A failed index read leaves the read whole; the evaluator still filters.
+    absl::StatusOr<std::optional<KeySet>> key_set =
+        table_->KeySetForColumnValues(values);
+    if (key_set.ok() && key_set->has_value()) {
+      read_arg_.key_set = **key_set;
+    }
+  }
+
+  const QueryableTable* table_;
+
   RowReader* reader_;
 
   // What is read, its key set narrowed by SetColumnFilterMap.
@@ -245,7 +231,9 @@ class KeyFilteredTableIterator : public googlesql::EvaluatorTableIterator {
 
   std::vector<const googlesql::Type*> column_types_;
 
-  std::vector<int> leading_key_positions_;
+  std::vector<int> column_idxs_;
+
+  std::optional<ColumnValues> dml_values_;
 
   // The rows, once the read has been made.
   std::unique_ptr<RowCursorEvaluatorTableIterator> rows_;
@@ -253,6 +241,139 @@ class KeyFilteredTableIterator : public googlesql::EvaluatorTableIterator {
   absl::Status read_status_;
 };
 
+namespace {
+
+// Whether SQL equality of the type is the equality of its key values.
+bool HasKeyEquality(const googlesql::Type* type) {
+  return type->IsInt64() || type->IsString() || type->IsBytes() ||
+         type->IsBool() || type->IsDate() || type->IsTimestamp();
+}
+
+// Extends 'prefixes' by one key column with the values 'values' holds for it.
+// Returns false, leaving 'prefixes' as they were, if the column has no values,
+// a value is not of the column's type, or the keys would pass the limit.
+bool ExtendPrefixes(const ColumnValues& values, int column_idx,
+                    const googlesql::Type* column_type,
+                    std::vector<Key>* prefixes) {
+  auto wanted = values.find(column_idx);
+  if (wanted == values.end() || !HasKeyEquality(column_type) ||
+      !std::all_of(wanted->second.begin(), wanted->second.end(),
+                   [column_type](const googlesql::Value& value) {
+                     return value.type()->Equals(column_type);
+                   }) ||
+      prefixes->size() * wanted->second.size() > kMaxKeysFromFilters) {
+    return false;
+  }
+  std::vector<Key> extended;
+  extended.reserve(prefixes->size() * wanted->second.size());
+  for (const Key& prefix : *prefixes) {
+    for (const googlesql::Value& value : wanted->second) {
+      Key key = prefix;
+      key.AddColumn(value);
+      extended.push_back(std::move(key));
+    }
+  }
+  *prefixes = std::move(extended);
+  return true;
+}
+
+KeySet PrefixKeySet(const std::vector<Key>& prefixes) {
+  // An empty list is a filter no row passes, and leaves an empty key set.
+  KeySet key_set;
+  for (const Key& prefix : prefixes) {
+    key_set.AddRange(KeyRange::Prefix(prefix));
+  }
+  return key_set;
+}
+
+}  // namespace
+
+absl::StatusOr<std::optional<KeySet>> QueryableTable::KeySetForColumnValues(
+    const ColumnValues& values) const {
+  // The primary key first: it needs no second read.
+  std::vector<Key> prefixes = {Key()};
+  int narrowed = 0;
+  for (int column_idx : primary_key_column_indexes_) {
+    if (!ExtendPrefixes(values, column_idx, GetColumn(column_idx)->GetType(),
+                        &prefixes)) {
+      break;
+    }
+    ++narrowed;
+  }
+  if (narrowed > 0) {
+    return PrefixKeySet(prefixes);
+  }
+
+  // Then the index with the most leading key columns the values narrow.
+  const Index* best_index = nullptr;
+  std::vector<Key> best_prefixes;
+  int best_narrowed = 0;
+  for (const Index* index : wrapped_table_->indexes()) {
+    if (index->is_search_index() || index->is_vector_index()) {
+      continue;
+    }
+    std::vector<Key> index_prefixes = {Key()};
+    int index_narrowed = 0;
+    for (const KeyColumn* key_column : index->key_columns()) {
+      // Index key columns belong to the index data table; each has the column
+      // of this table it copies as its source.
+      const Column* source = key_column->column()->source_column();
+      int column_idx = source == nullptr ? -1 : ColumnIndex(source);
+      if (column_idx < 0 ||
+          !ExtendPrefixes(values, column_idx,
+                          GetColumn(column_idx)->GetType(), &index_prefixes)) {
+        break;
+      }
+      ++index_narrowed;
+    }
+    if (index_narrowed > best_narrowed) {
+      best_index = index;
+      best_prefixes = std::move(index_prefixes);
+      best_narrowed = index_narrowed;
+    }
+  }
+  if (best_index == nullptr) {
+    return std::nullopt;
+  }
+
+  ReadArg index_read;
+  index_read.table = wrapped_table_->Name();
+  index_read.index = best_index->Name();
+  index_read.key_set = PrefixKeySet(best_prefixes);
+  index_read.allow_pending_commit_timestamps = true;
+  for (const KeyColumn* key_column : wrapped_table_->primary_key()) {
+    index_read.columns.push_back(key_column->column()->Name());
+  }
+  std::unique_ptr<RowCursor> cursor;
+  GOOGLESQL_RETURN_IF_ERROR(reader_->Read(index_read, &cursor));
+  KeySet key_set;
+  size_t keys = 0;
+  while (cursor->Next()) {
+    if (++keys > kMaxKeysFromFilters) {
+      return std::nullopt;
+    }
+    Key key;
+    for (int i = 0; i < cursor->NumColumns(); ++i) {
+      key.AddColumn(cursor->ColumnValue(i));
+    }
+    key_set.AddKey(key);
+  }
+  GOOGLESQL_RETURN_IF_ERROR(cursor->Status());
+  return key_set;
+}
+
+int QueryableTable::ColumnIndex(const Column* column) const {
+  for (int i = 0; i < columns_.size(); ++i) {
+    if (columns_[i]->wrapped_column() == column) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void QueryableTable::SetDmlColumnValues(ColumnValues values) const {
+  dml_values_ = std::move(values);
+}
 
 absl::StatusOr<std::shared_ptr<const googlesql::AnalyzerOutput>>
 QueryableTable::AnalyzeColumnExpression(
@@ -383,23 +504,14 @@ QueryableTable::CreateEvaluatorTableIterator(
     }
   }
 
-  // The leading primary key columns this scan reads, by their position in it.
-  std::vector<int> leading_key_positions;
-  if (KeyFilterPushdownEnabled() &&
-      wrapped_table_->owner_change_stream() == nullptr &&
-      primary_key_column_indexes_.size() ==
+  // The values a modifying statement allows, for its one read of the table.
+  std::optional<ColumnValues> dml_values = std::move(dml_values_);
+  dml_values_.reset();
+
+  if (!KeyFilterPushdownEnabled() ||
+      wrapped_table_->owner_change_stream() != nullptr ||
+      primary_key_column_indexes_.size() !=
           wrapped_table_->primary_key().size()) {
-    for (int key_column_idx : primary_key_column_indexes_) {
-      auto scanned =
-          std::find(column_idxs.begin(), column_idxs.end(), key_column_idx);
-      if (scanned == column_idxs.end()) {
-        break;
-      }
-      leading_key_positions.push_back(
-          static_cast<int>(scanned - column_idxs.begin()));
-    }
-  }
-  if (leading_key_positions.empty()) {
     std::unique_ptr<RowCursor> cursor;
     GOOGLESQL_RETURN_IF_ERROR(reader_->Read(read_arg, &cursor));
     return std::make_unique<RowCursorEvaluatorTableIterator>(
@@ -412,8 +524,9 @@ QueryableTable::CreateEvaluatorTableIterator(
     column_types.push_back(GetColumn(idx)->GetType());
   }
   return std::make_unique<KeyFilteredTableIterator>(
-      reader_, std::move(read_arg), std::move(column_types),
-      std::move(leading_key_positions));
+      this, reader_, std::move(read_arg), std::move(column_types),
+      std::vector<int>(column_idxs.begin(), column_idxs.end()),
+      std::move(dml_values));
 }
 
 const googlesql::Column* QueryableTable::FindColumnByName(

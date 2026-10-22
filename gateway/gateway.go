@@ -55,6 +55,7 @@ type Options struct {
 	OverrideMaxDatabasesPerInstance                int
 	OverrideChangeStreamPartitionTokenAliveSeconds int
 	RemoteFunctionsHostPort                        string
+	LockWaitTimeoutMs                              int
 }
 
 // Gateway implements the emulator gateway server.
@@ -95,6 +96,10 @@ func (gw *Gateway) Run() {
 	emulatorArgs = append(emulatorArgs,
 		fmt.Sprintf("--override_change_stream_partition_token_alive_seconds=%d",
 			gw.opts.OverrideChangeStreamPartitionTokenAliveSeconds))
+	if gw.opts.LockWaitTimeoutMs > 0 {
+		emulatorArgs = append(emulatorArgs,
+			fmt.Sprintf("--lock_wait_timeout_ms=%d", gw.opts.LockWaitTimeoutMs))
+	}
 
 
 	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)

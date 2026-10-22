@@ -24,9 +24,12 @@
 
 #include "googlesql/public/catalog.h"
 #include "googlesql/public/evaluator_table_iterator.h"
+#include "googlesql/public/value.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "backend/access/read.h"
+#include "backend/datamodel/key_set.h"
 #include "backend/query/column_expression_analysis_cache.h"
 #include "backend/query/queryable_column.h"
 #include "backend/schema/catalog/change_stream.h"
@@ -37,6 +40,9 @@ namespace google {
 namespace spanner {
 namespace emulator {
 namespace backend {
+
+// Values by table column index, from equality and IN filters.
+using ColumnValues = absl::flat_hash_map<int, std::vector<googlesql::Value>>;
 
 // A wrapper over Table class which implements googlesql::Table.
 // QueryableTable builds instances of EvalutorTableIterator by reading data of
@@ -77,6 +83,16 @@ class QueryableTable : public googlesql::Table {
 
   const backend::Table* wrapped_table() const { return wrapped_table_; }
 
+  // Returns the keys of the rows whose columns can hold 'values': prefixes of
+  // the primary key, or the keys an index read finds. Returns nullopt if the
+  // values narrow no key.
+  absl::StatusOr<std::optional<KeySet>> KeySetForColumnValues(
+      const ColumnValues& values) const;
+
+  // Narrows the next iterator this table creates by 'values', for a statement
+  // that modifies rows and reads this table once.
+  void SetDmlColumnValues(ColumnValues values) const;
+
   // Override CreateEvaluatorTableIterator.
   absl::StatusOr<std::unique_ptr<googlesql::EvaluatorTableIterator>>
   CreateEvaluatorTableIterator(
@@ -110,6 +126,12 @@ class QueryableTable : public googlesql::Table {
 
   // A list of ordinal indexes of the primary key columns of the table.
   std::vector<int> primary_key_column_indexes_;
+
+  // Returns the index of the column that wraps 'column', or -1.
+  int ColumnIndex(const Column* column) const;
+
+  // Set by SetDmlColumnValues and taken by the next iterator.
+  mutable std::optional<ColumnValues> dml_values_;
 };
 
 }  // namespace backend

@@ -115,6 +115,7 @@ cc_library(
         ":dml_query_validator",
         ":function_catalog",
         ":hint_rewriter",
+        ":join_lookup_rewriter",
         ":index_hint_validator",
         ":insert_on_conflict_dml_execution",
         ":partitionability_validator",
@@ -308,6 +309,22 @@ cc_test(
         "@com_google_googlesql//googlesql/resolved_ast",
         "@com_google_googlesql//googlesql/resolved_ast:make_node_vector",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "join_lookup_rewriter",
+    srcs = ["join_lookup_rewriter.cc"],
+    hdrs = ["join_lookup_rewriter.h"],
+    deps = [
+        ":queryable_column",
+        ":queryable_table",
+        "//backend/schema/catalog:schema",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_googlesql//googlesql/base:status",
+        "@com_google_googlesql//googlesql/public:type",
+        "@com_google_googlesql//googlesql/resolved_ast",
     ],
 )
 
@@ -841,6 +858,7 @@ cc_library(
         "function_catalog.h",
     ],
     deps = [
+        "@com_google_absl//absl/synchronization",
         ":column_expression_analysis_cache",
         ":analyzer_options",
         "//backend/common:case",
