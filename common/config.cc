@@ -19,6 +19,7 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/time/time.h"
 
 ABSL_FLAG(std::string, host_port, "localhost:10007",
           "Emulator host IP and port that serves Cloud Spanner gRPC requests.");
@@ -51,6 +52,12 @@ ABSL_FLAG(
     "to the current transaction. A value of zero means that the emulator will "
     "never abort the current transaction.");
 
+ABSL_FLAG(int, lock_wait_timeout_ms, 0,
+          "How long a transaction waits for another transaction to release "
+          "the database lock before the emulator aborts one of them. Waiting "
+          "avoids client retry backoff when transactions overlap. A value of "
+          "zero aborts at once.");
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -74,6 +81,14 @@ int abort_current_transaction_probability() {
 
 void set_abort_current_transaction_probability(int probability) {
   absl::SetFlag(&FLAGS_abort_current_transaction_probability, probability);
+}
+
+absl::Duration lock_wait_timeout() {
+  return absl::Milliseconds(absl::GetFlag(FLAGS_lock_wait_timeout_ms));
+}
+
+void set_lock_wait_timeout(absl::Duration timeout) {
+  absl::SetFlag(&FLAGS_lock_wait_timeout_ms, absl::ToInt64Milliseconds(timeout));
 }
 
 }  // namespace config

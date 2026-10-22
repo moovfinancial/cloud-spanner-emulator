@@ -19,6 +19,8 @@
 
 #include <string>
 
+#include "absl/time/time.h"
+
 namespace google {
 namespace spanner {
 namespace emulator {
@@ -53,6 +55,12 @@ bool disable_query_null_filtered_index_check();
 int abort_current_transaction_probability();
 
 void set_abort_current_transaction_probability(int probability);
+
+// How long a transaction waits for the database lock before the emulator
+// aborts one of the transactions. Zero aborts at once.
+absl::Duration lock_wait_timeout();
+
+void set_lock_wait_timeout(absl::Duration timeout);
 
 }  // namespace config
 }  // namespace emulator

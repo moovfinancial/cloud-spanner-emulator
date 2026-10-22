@@ -43,6 +43,19 @@ std::unique_ptr<LockHandle> LockManager::CreateHandle(
   return absl::WrapUnique(new LockHandle(this, tid, abort_fn, priority));
 }
 
+void LockManager::WaitForLockLocked(LockHandle* handle) {
+  const absl::Duration timeout = config::lock_wait_timeout();
+  if (timeout <= absl::ZeroDuration()) {
+    return;
+  }
+  const absl::Time deadline = absl::Now() + timeout;
+  while (active_handle_ != nullptr && active_handle_->tid() != handle->tid()) {
+    if (lock_released_cvar_.WaitWithDeadline(&mu_, deadline)) {
+      return;
+    }
+  }
+}
+
 void LockManager::EnqueueLock(LockHandle* handle, const LockRequest& request) {
   absl::MutexLock lock(mu_);
 
@@ -50,6 +63,10 @@ void LockManager::EnqueueLock(LockHandle* handle, const LockRequest& request) {
   if (handle->IsAborted()) {
     return;
   }
+
+  // Wait for the holder to finish before aborting either transaction. An
+  // abort makes the client sleep in backoff and redo the whole transaction.
+  WaitForLockLocked(handle);
 
   // If there is no transaction holding the lock, we grant it.
   if (active_handle_ == nullptr) {
@@ -95,11 +112,13 @@ void LockManager::UnlockAll(LockHandle* handle) {
   // Clear the active transaction if it holds the lock.
   active_handle_ = nullptr;
   handle->Reset();
+  lock_released_cvar_.Signal();
 }
 
 absl::StatusOr<absl::Time> LockManager::ReserveCommitTimestamp(
     LockHandle* handle) {
   absl::MutexLock lock(mu_);
+  WaitForLockLocked(handle);
 
   // If there is no transaction holding the lock, we grant it to the transaction
   // requesting commit timestamp. This can happen if transaction has empty
@@ -135,8 +154,12 @@ void LockManager::WaitForSafeRead(absl::Time read_time) {
   // Wait for read time to become current if passed a future timestamp  for the
   // case of exact timestamp bound for snapshot read.
   // https://cloud.google.com/spanner/docs/timestamp-bounds#introduction
-  bool f = false;
-  mu_.AwaitWithDeadline(absl::Condition(&f), read_time);
+  // A strong read picks the current time, so skip the wait when the time has
+  // passed: a timed wait on the mutex costs a full unlock and relock.
+  if (read_time > absl::Now()) {
+    bool f = false;
+    mu_.AwaitWithDeadline(absl::Condition(&f), read_time);
+  }
 
   while (pending_commit_timestamp_ < read_time) {
     pending_commit_cvar_.Wait(&mu_);
