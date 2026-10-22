@@ -53,6 +53,7 @@
 #include "googlesql/resolved_ast/resolved_node_kind.pb.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/strings/ascii.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -763,6 +764,123 @@ absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedInsert(
                              std::move(cursor)};
 }
 
+// Returns the value of 'expr' if it is a literal or a parameter.
+std::optional<googlesql::Value> ConstantValue(
+    const googlesql::ResolvedExpr* expr,
+    const googlesql::ParameterValueMap& parameters) {
+  if (expr->Is<googlesql::ResolvedLiteral>()) {
+    return expr->GetAs<googlesql::ResolvedLiteral>()->value();
+  }
+  if (expr->Is<googlesql::ResolvedParameter>()) {
+    const std::string& name =
+        expr->GetAs<googlesql::ResolvedParameter>()->name();
+    auto it = parameters.find(name);
+    if (it == parameters.end()) {
+      it = parameters.find(absl::AsciiStrToLower(name));
+    }
+    if (it != parameters.end()) {
+      return it->second;
+    }
+  }
+  return std::nullopt;
+}
+
+// Adds to 'values', by table column index of 'scan', the values that the
+// equality, IN, and IN UNNEST conjuncts of 'expr' allow.
+void CollectColumnValues(const googlesql::ResolvedExpr* expr,
+                         const googlesql::ResolvedTableScan* scan,
+                         const googlesql::ParameterValueMap& parameters,
+                         ColumnValues* values) {
+  if (!expr->Is<googlesql::ResolvedFunctionCall>()) {
+    return;
+  }
+  const auto* call = expr->GetAs<googlesql::ResolvedFunctionCall>();
+  const std::string& name = call->function()->Name();
+  const auto& args = call->argument_list();
+  if (name == "$and") {
+    for (const auto& arg : args) {
+      CollectColumnValues(arg.get(), scan, parameters, values);
+    }
+    return;
+  }
+  auto column_index = [scan](const googlesql::ResolvedExpr* e) -> int {
+    if (!e->Is<googlesql::ResolvedColumnRef>()) {
+      return -1;
+    }
+    const auto& column = e->GetAs<googlesql::ResolvedColumnRef>()->column();
+    for (int i = 0; i < scan->column_list_size(); ++i) {
+      if (scan->column_list(i).column_id() == column.column_id()) {
+        return scan->column_index_list(i);
+      }
+    }
+    return -1;
+  };
+  if (args.empty()) {
+    return;
+  }
+  int column = column_index(args[0].get());
+  if (name == "$equal" && args.size() == 2) {
+    const googlesql::ResolvedExpr* other = args[1].get();
+    if (column < 0) {
+      column = column_index(args[1].get());
+      other = args[0].get();
+    }
+    std::optional<googlesql::Value> value = ConstantValue(other, parameters);
+    if (column >= 0 && value.has_value()) {
+      values->try_emplace(column, std::vector<googlesql::Value>{*value});
+    }
+  } else if (name == "$in" && column >= 0) {
+    std::vector<googlesql::Value> list;
+    for (int i = 1; i < args.size(); ++i) {
+      std::optional<googlesql::Value> value =
+          ConstantValue(args[i].get(), parameters);
+      if (!value.has_value()) {
+        return;
+      }
+      list.push_back(*value);
+    }
+    values->try_emplace(column, std::move(list));
+  } else if (name == "$in_array" && column >= 0 && args.size() == 2) {
+    std::optional<googlesql::Value> array =
+        ConstantValue(args[1].get(), parameters);
+    if (array.has_value() && array->type()->IsArray() && !array->is_null()) {
+      values->try_emplace(column, array->elements());
+    }
+  }
+}
+
+// Narrows the one read of the table a modifying statement makes to the keys
+// its WHERE clause allows. The evaluator still applies the WHERE clause to each
+// row read. Skipped if the statement reads the table more than once.
+void NarrowDmlScan(const googlesql::ResolvedStatement* statement,
+                   const googlesql::ResolvedTableScan* scan,
+                   const googlesql::ResolvedExpr* where,
+                   const googlesql::ParameterValueMap& parameters) {
+  if (scan == nullptr || where == nullptr) {
+    return;
+  }
+  const auto* table = dynamic_cast<const QueryableTable*>(scan->table());
+  if (table == nullptr) {
+    return;
+  }
+  std::vector<const googlesql::ResolvedNode*> scans;
+  statement->GetDescendantsWithKinds({googlesql::RESOLVED_TABLE_SCAN}, &scans);
+  int reads = 0;
+  for (const googlesql::ResolvedNode* node : scans) {
+    if (node->GetAs<googlesql::ResolvedTableScan>()->table() == scan->table()) {
+      ++reads;
+    }
+  }
+  if (reads != 1) {
+    return;
+  }
+  ColumnValues values;
+  CollectColumnValues(where, scan, parameters, &values);
+  if (!values.empty()) {
+    table->SetDmlColumnValues(std::move(values));
+  }
+}
+
 absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedUpdate(
     const googlesql::ResolvedUpdateStmt* update_statement,
     const googlesql::ParameterValueMap& parameters,
@@ -777,6 +895,8 @@ absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedUpdate(
                    MakeAnalyzerOptionsWithParameters(parameters, time_zone));
   GOOGLESQL_RETURN_IF_ERROR(prepared_update->Prepare(analyzer_options));
 
+  NarrowDmlScan(update_statement, update_statement->table_scan(),
+                update_statement->where_expr(), parameters);
   std::unique_ptr<googlesql::EvaluatorTableIterator> returning_iter;
   auto status_or = prepared_update->Execute(parameters, {}, &returning_iter);
   if (!status_or.ok()) {
@@ -808,6 +928,8 @@ absl::StatusOr<ExecuteUpdateResult> EvaluateResolvedDelete(
                    MakeAnalyzerOptionsWithParameters(parameters, time_zone));
   GOOGLESQL_RETURN_IF_ERROR(prepared_delete->Prepare(analyzer_options));
 
+  NarrowDmlScan(delete_statement, delete_statement->table_scan(),
+                delete_statement->where_expr(), parameters);
   std::unique_ptr<googlesql::EvaluatorTableIterator> returning_iter;
   GOOGLESQL_ASSIGN_OR_RETURN(auto iterator,
                    prepared_delete->Execute(parameters, {}, &returning_iter));
@@ -1370,7 +1492,12 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
                    MakeAnalyzerOptionsWithParameters(
                        normalized_query.declared_params,
                        GetTimeZone(function_catalog_.GetLatestSchema())));
-  analyzer_options.set_prune_unused_columns(true);
+  // A DML statement is analyzed without column pruning. Find it before the
+  // first analysis so it is analyzed once, not twice.
+  const bool unpruned_dml =
+      context.schema->dialect() != database_api::DatabaseDialect::POSTGRESQL &&
+      IsDMLQuery(normalized_query.sql);
+  analyzer_options.set_prune_unused_columns(!unpruned_dml);
 
   QueryEvaluatorForEngine view_evaluator(*this, context,
                                          normalized_query.secure_context);
@@ -1435,21 +1562,23 @@ absl::StatusOr<QueryResult> QueryEngine::ExecuteSql(
     result.rows = std::move(cursor);
   } else {
     GOOGLESQL_RET_CHECK_NE(context.writer, nullptr);
-    analyzer_options.set_prune_unused_columns(false);
-    if (context.schema->dialect() ==
-        database_api::DatabaseDialect::POSTGRESQL) {
-      GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
-                       AnalyzePostgreSQL(normalized_query.sql, catalog.get(),
-                                         analyzer_options, type_factory_,
-                                         &function_catalog_));
-    } else {
-      GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
-                       Analyze(normalized_query.sql, catalog.get(),
-                               analyzer_options, type_factory_));
+    if (!unpruned_dml) {
+      analyzer_options.set_prune_unused_columns(false);
+      if (context.schema->dialect() ==
+          database_api::DatabaseDialect::POSTGRESQL) {
+        GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
+                         AnalyzePostgreSQL(normalized_query.sql, catalog.get(),
+                                           analyzer_options, type_factory_,
+                                           &function_catalog_));
+      } else {
+        GOOGLESQL_ASSIGN_OR_RETURN(analyzer_output,
+                         Analyze(normalized_query.sql, catalog.get(),
+                                 analyzer_options, type_factory_));
+      }
+      GOOGLESQL_ASSIGN_OR_RETURN(resolved_statement,
+                       ExtractValidatedResolvedStatementAndOptions(
+                           analyzer_output.get(), context, catalog.get()));
     }
-    GOOGLESQL_ASSIGN_OR_RETURN(resolved_statement,
-                     ExtractValidatedResolvedStatementAndOptions(
-                         analyzer_output.get(), context, catalog.get()));
 
     // Only execute the SQL statement if the user did not request PLAN mode.
     if (query_mode != v1::ExecuteSqlRequest::PLAN) {
@@ -1614,6 +1743,12 @@ absl::StatusOr<ChangeStreamQueryValidator::ChangeStreamMetadata>
 QueryEngine::TryGetChangeStreamMetadata(const Query& query,
                                         const Schema* schema,
                                         bool in_read_write_txn) {
+  // Only a query over a change stream TVF is a change stream query. Without
+  // change streams in the schema, skip the second catalog build and analysis;
+  // ExecuteSql analyzes the statement and reports any error.
+  if (schema->change_streams().empty()) {
+    return ChangeStreamQueryValidator::ChangeStreamMetadata();
+  }
   const absl::Time start_time = absl::Now();
   Query local_query;
   NormalizeParameterNames(schema, query, &local_query);

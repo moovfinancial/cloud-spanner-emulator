@@ -1711,6 +1711,53 @@ TEST_P(QueryEngineTest, CanInsertZeroRowsWithSelectStatement) {
   EXPECT_EQ(result.modified_row_count, 0);
 }
 
+TEST_P(QueryEngineTest, UpdateByKeyModifiesOnlyTheMatchingRow) {
+  MockRowWriter writer;
+  EXPECT_CALL(writer,
+              Write(Property(
+                  &Mutation::ops,
+                  UnorderedElementsAre(AllOf(
+                      Field(&MutationOp::type, MutationOpType::kUpdate),
+                      Field(&MutationOp::rows,
+                            UnorderedElementsAre(ValueList{
+                                Int64(2), String("updated")})))))))
+      .Times(1)
+      .WillOnce(Return(absl::OkStatus()));
+  std::string sql =
+      "UPDATE test_table SET string_col = 'updated' "
+      "WHERE int64_col = 2 AND string_col = 'two'";
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(Query{sql},
+                                QueryContext{schema(), reader(), &writer}));
+  EXPECT_EQ(result.modified_row_count, 1);
+}
+
+TEST_P(QueryEngineTest, UpdateThatReadsItsTableTwiceSeesEveryRow) {
+  if (GetParam() == POSTGRESQL) {
+    GTEST_SKIP() << "The subquery uses GoogleSQL casts.";
+  }
+  MockRowWriter writer;
+  EXPECT_CALL(writer,
+              Write(Property(
+                  &Mutation::ops,
+                  UnorderedElementsAre(AllOf(
+                      Field(&MutationOp::type, MutationOpType::kUpdate),
+                      Field(&MutationOp::rows,
+                            UnorderedElementsAre(ValueList{
+                                Int64(1), String("3")})))))))
+      .Times(1)
+      .WillOnce(Return(absl::OkStatus()));
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(
+          Query{"UPDATE test_table SET string_col = "
+                "(SELECT CAST(COUNT(*) AS STRING) FROM test_table) "
+                "WHERE int64_col = 1"},
+          QueryContext{schema(), reader(), &writer}));
+  EXPECT_EQ(result.modified_row_count, 1);
+}
+
 TEST_P(QueryEngineTest, ConnotUpdatePrimaryKey) {
   MockRowWriter writer;
   EXPECT_THAT(query_engine().ExecuteSql(
@@ -2400,6 +2447,15 @@ TEST_P(QueryEngineTest, TestGetEmptyChangeStreamMetadataFromNormalQuery) {
   Query query{"SELECT * FROM test_table"};
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto metadata, query_engine().TryGetChangeStreamMetadata(
                                           query, change_stream_schema()));
+  ASSERT_FALSE(metadata.is_change_stream_query);
+}
+
+TEST_P(QueryEngineTest, TestSkipChangeStreamAnalysisWithoutChangeStreams) {
+  // Without change streams the statement is not analyzed here, so even an
+  // invalid one returns empty metadata; ExecuteSql reports the error.
+  Query query{"SELECT * FROM no_such_table"};
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto metadata,
+                       query_engine().TryGetChangeStreamMetadata(query, schema()));
   ASSERT_FALSE(metadata.is_change_stream_query);
 }
 
