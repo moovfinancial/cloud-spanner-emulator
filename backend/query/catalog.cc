@@ -376,16 +376,6 @@ Catalog::Catalog(
                 kChangeStreamPartitionModeMutableKeyRange));
   }
 
-  // Read types.
-  for (const auto& tablepair : tables_) {
-    const QueryableTable* table = tablepair.second.get();
-    for (int i = 0; i < table->NumColumns(); ++i) {
-      std::string type_name = table->GetColumn(i)->GetType()->TypeName(
-          googlesql::PRODUCT_EXTERNAL, /*use_external_float32=*/true);
-      types_[type_name] = table->GetColumn(i)->GetType();
-    }
-  }
-
   if (absl::Status status = PopulateSystemProcedureMap(); !status.ok()) {
     // Not an error that requires us to exit the emulator.
     ABSL_LOG(ERROR) << "Failed to populate system procedure map: ";
@@ -577,8 +567,24 @@ absl::Status Catalog::GetTables(
   return absl::OkStatus();
 }
 
+void Catalog::ReadColumnTypes() const {
+  if (column_types_read_) {
+    return;
+  }
+  column_types_read_ = true;
+  for (const auto& tablepair : tables_) {
+    const QueryableTable* table = tablepair.second.get();
+    for (int i = 0; i < table->NumColumns(); ++i) {
+      std::string type_name = table->GetColumn(i)->GetType()->TypeName(
+          googlesql::PRODUCT_EXTERNAL, /*use_external_float32=*/true);
+      types_[type_name] = table->GetColumn(i)->GetType();
+    }
+  }
+}
+
 absl::Status Catalog::GetTypes(
     absl::flat_hash_set<const googlesql::Type*>* output) const {
+  ReadColumnTypes();
   for (const auto& [unused_name, type] : types_) {
     output->insert(type);
   }
@@ -589,6 +595,7 @@ absl::Status Catalog::GetType(const std::string& name,
                               const googlesql::Type** type,
                               const FindOptions& options) {
   *type = nullptr;
+  ReadColumnTypes();
   if (auto it = types_.find(name); it != types_.end()) {
     *type = it->second;
     return absl::OkStatus();
