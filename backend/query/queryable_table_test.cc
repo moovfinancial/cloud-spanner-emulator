@@ -285,6 +285,129 @@ TEST_F(QueryableTableKeyFilterTest, AScanWithoutTheLeadingKeyColumnReadsAll) {
             KeySet::All().DebugString());
 }
 
+// Answers index reads with the keys it is given and records the key set of the
+// last read of the table itself.
+class IndexAnsweringRowReader : public RowReader {
+ public:
+  explicit IndexAnsweringRowReader(
+      std::vector<std::vector<googlesql::Value>> index_rows)
+      : index_rows_(std::move(index_rows)) {}
+
+  absl::Status Read(const ReadArg& read_arg,
+                    std::unique_ptr<RowCursor>* cursor) override {
+    if (!read_arg.index.empty()) {
+      index_read_ = read_arg.index + " " + read_arg.key_set.DebugString();
+      *cursor = std::make_unique<test::TestRowCursor>(
+          read_arg.columns,
+          std::vector<const googlesql::Type*>{googlesql::types::StringType(),
+                                              googlesql::types::Int64Type()},
+          index_rows_);
+      return absl::OkStatus();
+    }
+    key_set_read_ = read_arg.key_set.DebugString();
+    *cursor = std::make_unique<test::TestRowCursor>(
+        std::vector<std::string>{}, std::vector<const googlesql::Type*>{},
+        std::vector<std::vector<googlesql::Value>>{});
+    return absl::OkStatus();
+  }
+
+  const std::string& index_read() const { return index_read_; }
+  const std::string& key_set_read() const { return key_set_read_; }
+
+ private:
+  std::vector<std::vector<googlesql::Value>> index_rows_;
+  std::string index_read_;
+  std::string key_set_read_;
+};
+
+// The table of QueryableTableKeyFilterTest with an index on note.
+class QueryableTableIndexFilterTest : public testing::Test {
+ protected:
+  static constexpr int kTenant = 0;
+  static constexpr int kId = 1;
+  static constexpr int kNote = 2;
+
+  const backend::Table* table() { return schema_->FindTable("tenant_rows"); }
+
+  static std::string Keys(std::vector<std::vector<googlesql::Value>> keys) {
+    KeySet key_set;
+    for (const auto& key : keys) {
+      key_set.AddKey(Key(key));
+    }
+    return key_set.DebugString();
+  }
+
+ private:
+  googlesql::TypeFactory type_factory_;
+  std::unique_ptr<const Schema> schema_ =
+      test::CreateSchemaFromDDL(
+          std::vector<std::string>{R"(CREATE TABLE tenant_rows (
+                tenant STRING(36) NOT NULL,
+                id INT64 NOT NULL,
+                note STRING(MAX),
+              ) PRIMARY KEY (tenant, id))",
+                                   "CREATE INDEX rows_by_note ON "
+                                   "tenant_rows(note)"},
+          &type_factory_)
+          .value();
+};
+
+TEST_F(QueryableTableIndexFilterTest, EqualityOnAnIndexedColumnReadsItsKeys) {
+  IndexAnsweringRowReader reader(
+      {{googlesql::values::String("acme"), googlesql::values::Int64(7)}});
+  QueryableTable table{this->table(), &reader};
+  auto iterator = table.CreateEvaluatorTableIterator({kNote}).value();
+  ColumnFilters filters;
+  filters[0] = std::make_unique<googlesql::ColumnFilter>(
+      std::vector<googlesql::Value>{googlesql::values::String("a note")});
+  GOOGLESQL_EXPECT_OK(iterator->SetColumnFilterMap(std::move(filters)));
+  EXPECT_FALSE(iterator->NextRow());
+  GOOGLESQL_EXPECT_OK(iterator->Status());
+
+  KeySet index_keys;
+  index_keys.AddRange(KeyRange::Prefix(Key({googlesql::values::String("a note")})));
+  EXPECT_EQ(reader.index_read(), "rows_by_note " + index_keys.DebugString());
+  EXPECT_EQ(reader.key_set_read(),
+            Keys({{googlesql::values::String("acme"),
+                   googlesql::values::Int64(7)}}));
+}
+
+TEST_F(QueryableTableIndexFilterTest, TheKeyIsPreferredOverAnIndex) {
+  IndexAnsweringRowReader reader({});
+  QueryableTable table{this->table(), &reader};
+  auto iterator =
+      table.CreateEvaluatorTableIterator({kTenant, kId, kNote}).value();
+  ColumnFilters filters;
+  filters[0] = std::make_unique<googlesql::ColumnFilter>(
+      std::vector<googlesql::Value>{googlesql::values::String("acme")});
+  filters[2] = std::make_unique<googlesql::ColumnFilter>(
+      std::vector<googlesql::Value>{googlesql::values::String("a note")});
+  GOOGLESQL_EXPECT_OK(iterator->SetColumnFilterMap(std::move(filters)));
+  EXPECT_FALSE(iterator->NextRow());
+
+  EXPECT_EQ(reader.index_read(), "");
+  KeySet key_set;
+  key_set.AddRange(KeyRange::Prefix(Key({googlesql::values::String("acme")})));
+  EXPECT_EQ(reader.key_set_read(), key_set.DebugString());
+}
+
+TEST_F(QueryableTableIndexFilterTest, DmlValuesNarrowTheNextReadOnly) {
+  IndexAnsweringRowReader reader({});
+  QueryableTable table{this->table(), &reader};
+  table.SetDmlColumnValues(
+      {{kTenant, {googlesql::values::String("acme")}}});
+
+  auto first = table.CreateEvaluatorTableIterator({kTenant, kNote}).value();
+  EXPECT_FALSE(first->NextRow());
+  KeySet key_set;
+  key_set.AddRange(KeyRange::Prefix(Key({googlesql::values::String("acme")})));
+  EXPECT_EQ(reader.key_set_read(), key_set.DebugString());
+
+  auto second = table.CreateEvaluatorTableIterator({kTenant, kNote}).value();
+  EXPECT_FALSE(second->NextRow());
+  EXPECT_EQ(reader.key_set_read(), KeySet::All().DebugString());
+}
+
 }  // namespace
 
 }  // namespace backend
