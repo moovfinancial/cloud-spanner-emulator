@@ -37,9 +37,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # The generated GoogleSQL sources need several GB each in GCC. Four at
-      # once runs the 16 GB hosted runner out of memory.
+      # once runs the 16 GB hosted runners out of memory (on amd64 the runner
+      # is shut down mid-compile).
       - name: Limit Bazel parallelism
-        if: matrix.platform == 'linux/arm64'
         run: echo 'build --jobs=2' >> .bazelrc
 
       # Anonymous Docker Hub pulls hit 429s on shared runners.
@@ -48,6 +48,19 @@ jobs:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
+
+      # Build first, then authenticate and push. The access token lasts an
+      # hour and a cold build takes several, so a token taken before the
+      # build has expired by the push. The push build reuses the layers of
+      # the first build from the local builder.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          platforms: ${{ matrix.platform }}
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
       - id: gcp_auth
         uses: google-github-actions/auth@v3
@@ -70,7 +83,6 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
       - name: Save digest
         run: |
