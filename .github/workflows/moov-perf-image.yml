@@ -20,7 +20,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: warp-ubuntu-latest-x64-32x
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
