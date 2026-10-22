@@ -105,7 +105,10 @@ cc_library(
     name = "config",
     srcs = ["config.cc"],
     hdrs = ["config.h"],
-    deps = ["@com_google_absl//absl/flags:flag"],
+    deps = [
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/time",
+    ],
 )
 
 cc_library(

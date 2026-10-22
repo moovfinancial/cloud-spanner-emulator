@@ -68,6 +68,10 @@ class LockManager {
   absl::Status MarkCommitted(LockHandle* handle) ABSL_LOCKS_EXCLUDED(mu_);
   void WaitForSafeRead(absl::Time read_time) ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Waits up to config::lock_wait_timeout() for no other transaction to hold
+  // the lock.
+  void WaitForLockLocked(LockHandle* handle) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   // Mutex to guard state below.
   absl::Mutex mu_;
 
@@ -86,6 +90,9 @@ class LockManager {
 
   // Signals completion of pending commit.
   absl::CondVar pending_commit_cvar_ ABSL_GUARDED_BY(mu_);
+
+  // Signals that no transaction holds the lock.
+  absl::CondVar lock_released_cvar_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace backend

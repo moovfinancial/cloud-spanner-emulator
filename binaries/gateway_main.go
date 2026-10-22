@@ -68,6 +68,10 @@ var (
 		"If true, the emulator will print all third-party notices to stdout.")
 	remoteFunctionsHostPort = flag.String("remote_functions_host_port", "",
 		"The host:port to use for remote functions.")
+	lockWaitTimeoutMs = flag.Int("lock_wait_timeout_ms", 0,
+		"How long a transaction waits for the database lock before the emulator aborts "+
+			"it. Zero aborts at once. The LOCK_WAIT_TIMEOUT_MS environment variable "+
+			"overrides this flag.")
 )
 
 // resolveGRPCBinary figures out the full path to the grpc binary from the --grpc_binary flag.
@@ -153,6 +157,14 @@ func main() {
 	}
 
 
+	lockWait := *lockWaitTimeoutMs
+	if v := os.Getenv("LOCK_WAIT_TIMEOUT_MS"); v != "" {
+		lockWait, err = strconv.Atoi(v)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	// Start the gateway http server. This will run the emulator grpc server as a subprocess and
 	// proxy http/json requests into grpc requests.
 	gwopts := gateway.Options{
@@ -167,6 +179,7 @@ func main() {
 		OverrideMaxDatabasesPerInstance:    instanceDbs,
 		OverrideChangeStreamPartitionTokenAliveSeconds: overrideChangeStreamPartitionTokenAliveSeconds,
 		RemoteFunctionsHostPort:                        *remoteFunctionsHostPort,
+		LockWaitTimeoutMs:                              lockWait,
 	}
 	gw := gateway.New(gwopts)
 	gw.Run()
