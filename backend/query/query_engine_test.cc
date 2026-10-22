@@ -90,6 +90,7 @@ using googlesql::values::Date;
 using googlesql::values::Enum;
 using googlesql::values::Int64;
 using googlesql::values::NullInt64;
+using googlesql::values::NullString;
 using googlesql::values::NullTimestamp;
 using googlesql::values::Numeric;
 using googlesql::values::Proto;
@@ -1181,6 +1182,33 @@ TEST_P(QueryEngineTest,
               IsOkAndHolds(UnorderedElementsAre(ElementsAre(String("one")),
                                                 ElementsAre(String("two")),
                                                 ElementsAre(String("four")))));
+}
+
+TEST_P(QueryEngineTest, JoinByKeyWithANarrowedLeftInputFindsItsRows) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(
+          Query{"SELECT a.int64_col, b.string_col FROM test_table a "
+                "JOIN test_table b ON b.int64_col = a.int64_col "
+                "WHERE a.int64_col = 2"},
+          QueryContext{schema(), reader()}));
+  EXPECT_THAT(GetAllColumnValues(std::move(result.rows)),
+              IsOkAndHolds(ElementsAre(ElementsAre(Int64(2), String("two")))));
+}
+
+TEST_P(QueryEngineTest, LeftJoinByKeyKeepsLeftRowsWithoutAMatch) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      QueryResult result,
+      query_engine().ExecuteSql(
+          Query{"SELECT a.int64_col, b.string_col FROM test_table a "
+                "LEFT JOIN test_table b ON b.int64_col = a.int64_col "
+                "AND b.string_col = 'none' WHERE a.int64_col IN (1, 2)"},
+          QueryContext{schema(), reader()}));
+  EXPECT_THAT(
+      GetAllColumnValues(std::move(result.rows)),
+      IsOkAndHolds(UnorderedElementsAre(
+          ElementsAre(Int64(1), NullString()),
+          ElementsAre(Int64(2), NullString()))));
 }
 
 TEST_P(QueryEngineTest, ExecuteSqlSelectsAllColumnsFromTable) {
