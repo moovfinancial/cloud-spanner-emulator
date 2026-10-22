@@ -188,7 +188,12 @@ class Catalog : public googlesql::EnumerableCatalog {
   CaseInsensitiveStringMap<const PropertyGraph*> unwrapped_property_graphs_;
 
   // Types available in the default schema.
-  CaseInsensitiveStringMap<const googlesql::Type*> types_;
+  // The types of the columns of every table, by name. Read on the first type
+  // lookup: naming every column type cost each statement time, and most
+  // statements look up no type.
+  void ReadColumnTypes() const;
+  mutable bool column_types_read_ = false;
+  mutable CaseInsensitiveStringMap<const googlesql::Type*> types_;
 
   // Change Stream TVFs available in the default schema.
   CaseInsensitiveStringMap<
