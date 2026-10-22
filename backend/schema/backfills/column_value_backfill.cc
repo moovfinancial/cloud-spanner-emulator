@@ -140,24 +140,25 @@ absl::Status BackfillEvaluatedColumnValue(
             (evaluated_column->is_generated() ||
              evaluated_column->has_default_value()));
   GOOGLESQL_RET_CHECK_NE(context, nullptr);
-  FunctionCatalog function_catalog(
-      context->type_factory(),
-      /*catalog_name=*/kCloudSpannerEmulatorFunctionCatalogName,
-      /*latest_schema=*/context->validated_new_schema());
-  function_catalog.SetLatestSchema(context->validated_new_schema());
-  googlesql::AnalyzerOptions analyzer_options = MakeGoogleSqlAnalyzerOptions(
-      context->validated_new_schema()->default_time_zone());
-  Catalog catalog(context->validated_new_schema(), &function_catalog,
-                  context->type_factory(), analyzer_options);
   const Table* table = evaluated_column->table();
-  EvaluatedColumnEffector effector(table, analyzer_options, &catalog);
-
   std::vector<ColumnID> column_ids = GetColumnIDs(table->columns());
   std::unique_ptr<StorageIterator> itr;
   GOOGLESQL_RETURN_IF_ERROR(context->storage()->Read(context->pending_commit_timestamp(),
                                            table->id(), KeyRange::All(),
                                            column_ids, &itr));
-  while (itr->Next()) {
+  // An empty table, as in a newly created database, has nothing to backfill.
+  if (!itr->Next()) {
+    return itr->Status();
+  }
+
+  PooledFunctionCatalog function_catalog(context->validated_new_schema());
+  googlesql::AnalyzerOptions analyzer_options = MakeGoogleSqlAnalyzerOptions(
+      context->validated_new_schema()->default_time_zone());
+  Catalog catalog(context->validated_new_schema(), function_catalog.get(),
+                  context->type_factory(), analyzer_options);
+  EvaluatedColumnEffector effector(table, analyzer_options, &catalog);
+
+  do {
     googlesql::ParameterValueMap row_column_values;
     for (int i = 0; i < itr->NumColumns(); ++i) {
       // Storage returns invalid values if a value is not present, in which case
@@ -175,7 +176,7 @@ absl::Status BackfillEvaluatedColumnValue(
     GOOGLESQL_RETURN_IF_ERROR(context->storage()->Write(
         context->pending_commit_timestamp(), table->id(), itr->Key(),
         {evaluated_column->id()}, {value}));
-  }
+  } while (itr->Next());
 
   return itr->Status();
 }

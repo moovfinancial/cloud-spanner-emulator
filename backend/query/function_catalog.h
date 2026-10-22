@@ -120,6 +120,25 @@ class FunctionCatalog {
   const backend::Schema* latest_schema_;
 };
 
+// Lends a FunctionCatalog from a process-wide pool. Building one creates the
+// thousands of GoogleSQL built-in functions, which costs milliseconds; a schema
+// change analyzes each default and generated column, so it borrows one instead.
+// Catalogs are built with a process-wide type factory and never freed, so
+// types and functions from them stay valid. A borrowed catalog is used by one
+// thread at a time.
+class PooledFunctionCatalog {
+ public:
+  explicit PooledFunctionCatalog(const backend::Schema* latest_schema);
+  ~PooledFunctionCatalog();
+  PooledFunctionCatalog(const PooledFunctionCatalog&) = delete;
+  PooledFunctionCatalog& operator=(const PooledFunctionCatalog&) = delete;
+
+  FunctionCatalog* get() const { return catalog_; }
+
+ private:
+  FunctionCatalog* catalog_;
+};
+
 }  // namespace backend
 }  // namespace emulator
 }  // namespace spanner
