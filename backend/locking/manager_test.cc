@@ -28,6 +28,7 @@
 #include "tests/common/proto_matchers.h"
 #include "absl/time/clock.h"
 #include "backend/common/ids.h"
+#include "common/config.h"
 
 namespace google {
 namespace spanner {
@@ -82,6 +83,46 @@ TEST_F(LockManagerTest, ConcurrentTransactionIsAborted) {
   EXPECT_THAT(lh2->Wait(),
               googlesql_base::testing::StatusIs(absl::StatusCode::kAborted));
   EXPECT_TRUE(lh2->IsAborted());
+}
+
+TEST_F(LockManagerTest, WaitingTransactionAcquiresLockAfterRelease) {
+  config::set_lock_wait_timeout(absl::Seconds(10));
+  std::unique_ptr<LockHandle> lh1 =
+      manager()->CreateHandle(TransactionID(1),
+                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
+  std::unique_ptr<LockHandle> lh2 =
+      manager()->CreateHandle(TransactionID(2),
+                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
+  lh1->EnqueueLock(request());
+  GOOGLESQL_EXPECT_OK(lh1->Wait());
+
+  std::thread release([&] {
+    absl::SleepFor(absl::Milliseconds(50));
+    lh1->UnlockAll();
+  });
+  lh2->EnqueueLock(request());
+  release.join();
+
+  GOOGLESQL_EXPECT_OK(lh2->Wait());
+  EXPECT_FALSE(lh2->IsAborted());
+  config::set_lock_wait_timeout(absl::ZeroDuration());
+}
+
+TEST_F(LockManagerTest, WaitingTransactionIsAbortedAfterTimeout) {
+  config::set_lock_wait_timeout(absl::Milliseconds(20));
+  std::unique_ptr<LockHandle> lh1 =
+      manager()->CreateHandle(TransactionID(1),
+                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
+  std::unique_ptr<LockHandle> lh2 =
+      manager()->CreateHandle(TransactionID(2),
+                              /*try_abort_fn=*/nullptr, TransactionPriority(1));
+  lh1->EnqueueLock(request());
+  GOOGLESQL_EXPECT_OK(lh1->Wait());
+
+  lh2->EnqueueLock(request());
+  EXPECT_THAT(lh2->Wait(),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kAborted));
+  config::set_lock_wait_timeout(absl::ZeroDuration());
 }
 
 TEST_F(LockManagerTest, SequentialTransactionAcquiresLock) {

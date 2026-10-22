@@ -60,6 +60,7 @@ cc_test(
     deps = [
         ":manager",
         "//backend/common:ids",
+        "//common:config",
         "//tests/common:proto_matchers",
         "@com_github_google_benchmark//:benchmark",
         "@com_github_grpc_grpc//:grpc++",
