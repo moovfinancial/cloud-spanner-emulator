@@ -49,31 +49,17 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
 
-      # Build first, then authenticate and push. The access token lasts an
-      # hour and a cold build takes several, so a token taken before the
-      # build has expired by the push. The push build reuses the layers of
-      # the first build from the local builder.
-      - uses: docker/build-push-action@v6
+      # Authenticate with a credential file and the gcloud Docker credential
+      # helper, not a one-hour access token: a cold build takes several hours,
+      # and the helper fetches a fresh token when the push needs one.
+      - uses: google-github-actions/auth@v3
         with:
-          context: .
-          file: build/docker/Dockerfile.ubuntu
-          platforms: ${{ matrix.platform }}
-          outputs: type=cacheonly
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-
-      - id: gcp_auth
-        uses: google-github-actions/auth@v3
-        with:
-          token_format: access_token
           workload_identity_provider: ${{ vars.GCP_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
-      - uses: docker/login-action@v3
-        with:
-          registry: us-docker.pkg.dev
-          username: oauth2accesstoken
-          password: ${{ steps.gcp_auth.outputs.access_token }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker us-docker.pkg.dev --quiet
 
       - id: build
         uses: docker/build-push-action@v6
@@ -83,6 +69,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
       - name: Save digest
         run: |
