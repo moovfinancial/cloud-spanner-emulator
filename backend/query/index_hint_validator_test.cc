@@ -279,6 +279,17 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithUnprovenFilter) {
            "WHERE col1 IN UNNEST(ARRAY(SELECT col2 FROM T2))",
            "SELECT k1 FROM T1@{force_index=NF_I1} "
            "WHERE col1 IN UNNEST(IFNULL(@ps, ['a']))",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST(ARRAY_CONCAT(@ps, ['a']))",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 LIKE 'a%'",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE STARTS_WITH(col1, 'a')",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 > @p OR (col1 = @p AND k1 > 0)",
+           // Cloud Spanner rejects this form. The emulator does not inspect
+           // OR, so the hint bypasses the check.
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST(@ps) OR k1 = 1",
        }) {
     SCOPED_TRACE(sql);
     auto output = AnalyzeQuery(sql);
@@ -323,6 +334,25 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithInUnnest) {
       EXPECT_EQ(output->resolved_statement()->Accept(&validator),
                 error::NullFilteredIndexUnusableForInUnnest("NF_I1", "col1"));
     }
+  }
+}
+
+TEST_F(IndexHintValidatorTest, InUnnestErrorWinsOverUnprovenScan) {
+  // Scan `a` forces NF_G with gcol unproven. Scan `b` forces NF_I1 with
+  // col1 IN UNNEST(@ps). Both join orders report the IN UNNEST error.
+  for (const char* sql : {
+           "SELECT a.k1 FROM T1@{force_index=NF_G} a "
+           "JOIN T1@{force_index=NF_I1} b ON a.k1 = b.k1 "
+           "WHERE b.col1 IN UNNEST(@ps)",
+           "SELECT a.k1 FROM T1@{force_index=NF_I1} b "
+           "JOIN T1@{force_index=NF_G} a ON a.k1 = b.k1 "
+           "WHERE b.col1 IN UNNEST(@ps)",
+       }) {
+    SCOPED_TRACE(sql);
+    auto output = AnalyzeQuery(sql);
+    IndexHintValidator validator{schema()};
+    EXPECT_EQ(output->resolved_statement()->Accept(&validator),
+              error::NullFilteredIndexUnusableForInUnnest("NF_I1", "col1"));
   }
 }
 

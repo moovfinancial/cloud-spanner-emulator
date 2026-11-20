@@ -260,8 +260,8 @@ absl::Status IndexHintValidator::ValidateIndexesForTables() {
       }
     }
   }
-  // Report the bypassable error last, so that an IN UNNEST error on any
-  // other scan wins.
+  // Report the bypassable error after every scan is checked, so that it
+  // never hides an IN UNNEST error on another scan.
   if (!unproven_index.empty()) {
     return error::NullFilteredIndexUnusable(unproven_index);
   }
