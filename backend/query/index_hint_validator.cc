@@ -92,8 +92,9 @@ struct ColumnFilter {
   // `col BETWEEN ...` or `col IN (...)`. The other operands can be any
   // expression, because a comparison with a NULL column is never true.
   bool not_null = false;
-  // A filter is `col IN UNNEST(@param)`. Cloud Spanner does not accept it as
-  // a filter that rejects NULLs.
+  // A filter is `col IN UNNEST(@param)`, with or without a cast on the
+  // parameter. Cloud Spanner does not accept it as a filter that rejects
+  // NULLs.
   bool in_unnest_param = false;
 };
 
@@ -101,6 +102,14 @@ bool IsColumn(const googlesql::ResolvedExpr* expr,
               const googlesql::ResolvedColumn& column) {
   return expr->Is<googlesql::ResolvedColumnRef>() &&
          expr->GetAs<googlesql::ResolvedColumnRef>()->column() == column;
+}
+
+// Returns true if 'expr' is a query parameter, with or without casts.
+bool IsParameter(const googlesql::ResolvedExpr* expr) {
+  while (expr->Is<googlesql::ResolvedCast>()) {
+    expr = expr->GetAs<googlesql::ResolvedCast>()->expr();
+  }
+  return expr->Is<googlesql::ResolvedParameter>();
 }
 
 bool IsComparison(absl::string_view name) {
@@ -140,7 +149,7 @@ ColumnFilter FilterOn(
         result.not_null = true;
       } else if (name == "$in_array" && args.size() == 2 &&
                  IsColumn(args[0].get(), column) &&
-                 args[1]->Is<googlesql::ResolvedParameter>()) {
+                 IsParameter(args[1].get())) {
         result.in_unnest_param = true;
       }
     }
@@ -181,6 +190,7 @@ absl::Status IndexHintValidator::VisitResolvedTableScan(
 }
 
 absl::Status IndexHintValidator::ValidateIndexesForTables() {
+  std::string unproven_index;
   for (auto [table_scan, index_name] : index_hints_map_) {
     if (absl::EqualsIgnoreCase(index_name, "_base_table")) {
       continue;
@@ -194,7 +204,7 @@ absl::Status IndexHintValidator::ValidateIndexesForTables() {
     // See comments above regarding special-casing of managed indexes.
     if (index == nullptr) {
       if (MatchesManagedIndexName(schema_table->Name(), index_name)) {
-        return absl::OkStatus();
+        continue;
       }
       return error::QueryHintIndexNotFound(schema_table->Name(), index_name);
     } else if (HasGeneratedEmulatorName(index)) {
@@ -244,10 +254,16 @@ absl::Status IndexHintValidator::ValidateIndexesForTables() {
         }
         unproven = unproven || !filter.not_null;
       }
-      if (unproven && !disable_null_filtered_index_check_) {
-        return error::NullFilteredIndexUnusable(index_name);
+      if (unproven && !disable_null_filtered_index_check_ &&
+          unproven_index.empty()) {
+        unproven_index = index_name;
       }
     }
+  }
+  // Report the bypassable error last, so that an IN UNNEST error on any
+  // other scan wins.
+  if (!unproven_index.empty()) {
+    return error::NullFilteredIndexUnusable(unproven_index);
   }
   return absl::OkStatus();
 }

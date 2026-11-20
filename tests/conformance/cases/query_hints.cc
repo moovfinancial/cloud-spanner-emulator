@@ -362,11 +362,24 @@ TEST_P(QueryHintsTest, NullFilteredIndexWithInUnnest) {
           "WHERE Age IN UNNEST(@ages)",
           params),
       StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(CommitDml({SqlStatement(
+                  "DELETE FROM Users@{force_index=UsersByAge} "
+                  "WHERE Age IN UNNEST(@ages)",
+                  params)}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 
   GOOGLESQL_EXPECT_OK(
       QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "
                       "WHERE Age IS NOT NULL AND Age IN UNNEST(@ages)",
                       params));
+
+  // Cloud Spanner accepts an array that is not a bare parameter. The
+  // emulator does not inspect it, so the hint bypasses the check.
+  GOOGLESQL_EXPECT_OK(QueryWithParams(
+      "SELECT ID FROM Users@{force_index=UsersByAge, "
+      "spanner_emulator.disable_query_null_filtered_index_check=true} "
+      "WHERE Age IN UNNEST([@age, 2])",
+      {{"age", cloud::spanner::Value(int64_t{1})}}));
 }
 
 TEST_P(QueryHintsTest, DisableNullFilteredIndexAtStatementLevel) {

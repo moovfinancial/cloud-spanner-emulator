@@ -273,6 +273,12 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithUnprovenFilter) {
            "SELECT k1 FROM T1@{force_index=NF_I1} WHERE NOT (col1 = @p)",
            "SELECT k1 FROM T1@{force_index=NF_I1} "
            "WHERE col1 IN UNNEST(['a', 'b'])",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST([@p, 'a'])",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST(ARRAY(SELECT col2 FROM T2))",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST(IFNULL(@ps, ['a']))",
        }) {
     SCOPED_TRACE(sql);
     auto output = AnalyzeQuery(sql);
@@ -287,6 +293,15 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithInUnnest) {
            "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IN UNNEST(@ps)",
            "SELECT k1 FROM T1@{force_index=NF_I1} "
            "WHERE k1 > 0 AND col1 IN UNNEST(@ps)",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST(CAST(@ps AS ARRAY<STRING>))",
+           // The other scan is only unproven. The IN UNNEST error wins.
+           "SELECT a.k1 FROM T1@{force_index=NF_I1} a "
+           "JOIN T1@{force_index=NF_I1} b ON a.k1 = b.k1 "
+           "WHERE b.col1 IN UNNEST(@ps)",
+           "SELECT a.k1 FROM T1@{force_index=NF_I1} a "
+           "JOIN T1@{force_index=NF_I1} b ON a.k1 = b.k1 "
+           "WHERE a.col1 IN UNNEST(@ps)",
            "SELECT k2 FROM T2 JOIN T1@{force_index=NF_I1} ON k1 = k2 "
            "WHERE col1 IN UNNEST(@ps)",
            "SELECT k2 FROM T2 LEFT JOIN T1@{force_index=NF_I1} ON k1 = k2 "
