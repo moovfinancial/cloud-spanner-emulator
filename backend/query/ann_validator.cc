@@ -29,6 +29,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "backend/query/ann_functions_rewriter.h"
+#include "backend/query/null_predicates.h"
 #include "backend/schema/catalog/column.h"
 #include "backend/schema/catalog/index.h"
 #include "backend/schema/ddl/operations.pb.h"
@@ -118,56 +119,12 @@ absl::Status GetNotNullColumns(
         const googlesql::ResolvedFilterScan* filter_scan =
             scan->GetAs<googlesql::ResolvedFilterScan>();
         scan = filter_scan->input_scan();
-        if (filter_scan->filter_expr() != nullptr &&
-            filter_scan->filter_expr()->Is<googlesql::ResolvedFunctionCall>()) {
-          const googlesql::ResolvedFunctionCall* func =
-              filter_scan->filter_expr()
-                  ->GetAs<googlesql::ResolvedFunctionCall>();
-          if (func->function()->Name() == "$and") {
-            for (const auto& arg : func->argument_list()) {
-              if (arg->Is<googlesql::ResolvedFunctionCall>()) {
-                const googlesql::ResolvedFunctionCall* not_func =
-                    arg->GetAs<googlesql::ResolvedFunctionCall>();
-                if (not_func->function()->Name() == "$not" &&
-                    not_func->argument_list_size() == 1 &&
-                    not_func->argument_list(0)
-                        ->Is<googlesql::ResolvedFunctionCall>() &&
-                    not_func->argument_list(0)
-                            ->GetAs<googlesql::ResolvedFunctionCall>()
-                            ->function()
-                            ->Name() == "$is_null") {
-                  const googlesql::ResolvedFunctionCall* is_null_func =
-                      not_func->argument_list(0)
-                          ->GetAs<googlesql::ResolvedFunctionCall>();
-                  if (is_null_func->argument_list_size() == 1 &&
-                      is_null_func->argument_list(0)
-                          ->Is<googlesql::ResolvedColumnRef>()) {
-                    not_null_columns.push_back(
-                        is_null_func->argument_list(0)
-                            ->GetAs<googlesql::ResolvedColumnRef>()
-                            ->column());
-                  }
-                }
-              }
-            }
-          } else if (func->function()->Name() == "$not") {
-            if (func->argument_list_size() == 1 &&
-                func->argument_list(0)->Is<googlesql::ResolvedFunctionCall>() &&
-                func->argument_list(0)
-                        ->GetAs<googlesql::ResolvedFunctionCall>()
-                        ->function()
-                        ->Name() == "$is_null") {
-              const googlesql::ResolvedFunctionCall* is_null_func =
-                  func->argument_list(0)
-                      ->GetAs<googlesql::ResolvedFunctionCall>();
-              if (is_null_func->argument_list_size() == 1 &&
-                  is_null_func->argument_list(0)
-                      ->Is<googlesql::ResolvedColumnRef>()) {
-                not_null_columns.push_back(
-                    is_null_func->argument_list(0)
-                        ->GetAs<googlesql::ResolvedColumnRef>()
-                        ->column());
-              }
+        if (filter_scan->filter_expr() != nullptr) {
+          std::vector<const googlesql::ResolvedExpr*> conjuncts;
+          Conjuncts(filter_scan->filter_expr(), &conjuncts);
+          for (const googlesql::ResolvedExpr* conjunct : conjuncts) {
+            if (const auto* column = IsNotNullColumn(conjunct)) {
+              not_null_columns.push_back(*column);
             }
           }
         }

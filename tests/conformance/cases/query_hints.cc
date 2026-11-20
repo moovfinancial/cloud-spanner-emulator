@@ -14,7 +14,9 @@
 // limitations under the License.
 //
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "gmock/gmock.h"
@@ -22,6 +24,7 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "tests/conformance/common/database_test_base.h"
 
 namespace google {
@@ -305,17 +308,78 @@ TEST_P(QueryHintsTest, DisableNullFilteredIndexCheckForValidQuery) {
       "spanner_emulator.disable_query_null_filtered_index_check=true} "
       "WHERE Age IS NOT NULL";
 
-  // The query is accepted in prod but rejected by the Emulator as it currently
-  // cannot determine nullability from the predicate."
-  if (in_prod_env()) {
-    GOOGLESQL_EXPECT_OK(Query(valid_query));
-  } else {
-    EXPECT_THAT(Query(valid_query),
-                StatusIs(absl::StatusCode::kInvalidArgument));
+  GOOGLESQL_EXPECT_OK(Query(valid_query));
+  GOOGLESQL_EXPECT_OK(Query(modified_valid_query));
+}
+
+TEST_P(QueryHintsTest, NullFilteredIndexWithComparison) {
+  if (dialect_ == database_api::DatabaseDialect::POSTGRESQL) {
+    GTEST_SKIP() << "PostgreSQL ignores the index hint instead of failing";
   }
 
-  // With the hint to disable null-filtered checks, the emulator is pacified.
-  GOOGLESQL_EXPECT_OK(Query(modified_valid_query));
+  for (const char* where : {
+           "Age = @age",
+           "Age != @age",
+           "Age < @age",
+           "Age >= @age",
+           "@age > Age",
+           "Age BETWEEN @age AND 100",
+           "Age IN (@age, 2)",
+       }) {
+    SCOPED_TRACE(where);
+    GOOGLESQL_EXPECT_OK(QueryWithParams(
+        absl::StrCat("SELECT ID FROM Users@{force_index=UsersByAge} WHERE ",
+                     where),
+        {{"age", cloud::spanner::Value(int64_t{1})}}));
+  }
+}
+
+TEST_P(QueryHintsTest, NullFilteredIndexWithInUnnest) {
+  if (dialect_ == database_api::DatabaseDialect::POSTGRESQL) {
+    GTEST_SKIP() << "PostgreSQL ignores the index hint instead of failing";
+  }
+
+  cloud::spanner::SqlStatement::ParamType params = {
+      {"ages", cloud::spanner::Value(std::vector<int64_t>{1, 2})}};
+
+  // Cloud Spanner cannot prove that IN UNNEST rejects NULLs. The hint to
+  // disable the null-filtered index check does not change that.
+  EXPECT_THAT(QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "
+                              "WHERE Age IN UNNEST(@ages)",
+                              params),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      QueryWithParams(
+          "SELECT ID FROM Users@{force_index=UsersByAge, "
+          "spanner_emulator.disable_query_null_filtered_index_check=true} "
+          "WHERE Age IN UNNEST(@ages)",
+          params),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      QueryWithParams(
+          "@{spanner_emulator.disable_query_null_filtered_index_check=true} "
+          "SELECT ID FROM Users@{force_index=UsersByAge} "
+          "WHERE Age IN UNNEST(@ages)",
+          params),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(CommitDml({SqlStatement(
+                  "DELETE FROM Users@{force_index=UsersByAge} "
+                  "WHERE Age IN UNNEST(@ages)",
+                  params)}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  GOOGLESQL_EXPECT_OK(
+      QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "
+                      "WHERE Age IS NOT NULL AND Age IN UNNEST(@ages)",
+                      params));
+
+  // Cloud Spanner accepts an array that is not a bare parameter. The
+  // emulator does not inspect it, so the hint bypasses the check.
+  GOOGLESQL_EXPECT_OK(QueryWithParams(
+      "SELECT ID FROM Users@{force_index=UsersByAge, "
+      "spanner_emulator.disable_query_null_filtered_index_check=true} "
+      "WHERE Age IN UNNEST([@age, 2])",
+      {{"age", cloud::spanner::Value(int64_t{1})}}));
 }
 
 TEST_P(QueryHintsTest, DisableNullFilteredIndexAtStatementLevel) {

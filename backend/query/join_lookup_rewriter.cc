@@ -26,6 +26,7 @@
 #include "googlesql/resolved_ast/resolved_node_kind.pb.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "backend/query/null_predicates.h"
 #include "backend/query/queryable_column.h"
 #include "backend/query/queryable_table.h"
 #include "backend/schema/catalog/column.h"
@@ -41,21 +42,6 @@ namespace backend {
 namespace {
 
 using ColumnSet = absl::flat_hash_set<googlesql::ResolvedColumn>;
-
-// Appends the conjuncts of 'expr' to 'conjuncts'.
-void Conjuncts(const googlesql::ResolvedExpr* expr,
-               std::vector<const googlesql::ResolvedExpr*>* conjuncts) {
-  if (expr->Is<googlesql::ResolvedFunctionCall>()) {
-    const auto* call = expr->GetAs<googlesql::ResolvedFunctionCall>();
-    if (call->function()->Name() == "$and") {
-      for (const auto& arg : call->argument_list()) {
-        Conjuncts(arg.get(), conjuncts);
-      }
-      return;
-    }
-  }
-  conjuncts->push_back(expr);
-}
 
 // Returns the column 'expr' refers to in 'columns', or nullptr.
 const googlesql::ResolvedColumn* LocalColumn(const googlesql::ResolvedExpr* expr,

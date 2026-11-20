@@ -3316,6 +3316,22 @@ absl::Status NullFilteredIndexUnusable(absl::string_view index_name) {
           index_name));
 }
 
+absl::Status NullFilteredIndexUnusableForInUnnest(
+    absl::string_view index_name, absl::string_view column_name) {
+  return absl::Status(
+      absl::StatusCode::kInvalidArgument,
+      absl::Substitute(
+          "The index $0 cannot be used because it filters nulls that are "
+          "required to answer the query for column $1. Cloud Spanner cannot "
+          "prove that `$1 IN UNNEST(@param)` excludes NULL values. Add "
+          "`$1 IS NOT NULL`, or another comparison on $1 such as "
+          "`$1 = @value` or `$1 > @value`, to the WHERE clause. The hint "
+          "@{spanner_emulator.disable_query_null_filtered_index_check=true} "
+          "does not bypass this check, because Cloud Spanner rejects this "
+          "query.",
+          index_name, column_name));
+}
+
 absl::Status NonPartitionableQuery(absl::string_view reason) {
   return absl::Status(
       absl::StatusCode::kInvalidArgument,
