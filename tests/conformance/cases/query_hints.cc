@@ -343,6 +343,13 @@ TEST_P(QueryHintsTest, NullFilteredIndexWithInUnnest) {
           "WHERE Age IN UNNEST(@ages)",
           params),
       StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      QueryWithParams(
+          "@{spanner_emulator.disable_query_null_filtered_index_check=true} "
+          "SELECT ID FROM Users@{force_index=UsersByAge} "
+          "WHERE Age IN UNNEST(@ages)",
+          params),
+      StatusIs(absl::StatusCode::kInvalidArgument));
 
   GOOGLESQL_EXPECT_OK(
       QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "

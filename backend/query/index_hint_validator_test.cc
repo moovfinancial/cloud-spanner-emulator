@@ -175,7 +175,9 @@ TEST_F(IndexHintValidatorTest,
 }
 
 TEST_F(IndexHintValidatorTest, DisableNullFilteredIndexCheck) {
-  // The emulator cannot prove that `col1 IN ('a', 'b')` rejects NULLs.
+  // The emulator does not treat `col1 IN ('a', 'b')` as a filter that rejects
+  // NULLs, because it is not confirmed that Cloud Spanner does. This is an
+  // emulator limitation, so the hint bypasses it.
   auto stmt1 = AnalyzeQuery(
       "SELECT col1 FROM T1@{force_index=NF_I1} "
       "WHERE col1 IN ('a', 'b')");
@@ -200,10 +202,18 @@ TEST_F(IndexHintValidatorTest, DisableNullFilteredIndexCheck) {
 }
 
 TEST_F(IndexHintValidatorTest, NullFilteredIndexWithIsNotNull) {
-  auto output = AnalyzeQuery(
-      "SELECT col1 FROM T1@{force_index=NF_I1} WHERE col1 IS NOT NULL");
-  IndexHintValidator validator{schema()};
-  GOOGLESQL_EXPECT_OK(output->resolved_statement()->Accept(&validator));
+  for (const char* sql : {
+           "SELECT col1 FROM T1@{force_index=NF_I1} WHERE col1 IS NOT NULL",
+           "SELECT k1 FROM (SELECT k1, col1 FROM T1@{force_index=NF_I1}) "
+           "WHERE col1 IS NOT NULL",
+           "SELECT k2 FROM T2 LEFT JOIN T1@{force_index=NF_I1} ON k1 = k2 "
+           "WHERE col1 IS NOT NULL",
+       }) {
+    SCOPED_TRACE(sql);
+    auto output = AnalyzeQuery(sql);
+    IndexHintValidator validator{schema()};
+    GOOGLESQL_EXPECT_OK(output->resolved_statement()->Accept(&validator));
+  }
 }
 
 TEST_F(IndexHintValidatorTest, NullFilteredIndexWithEquality) {
@@ -225,7 +235,9 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithEquality) {
 
 TEST_F(IndexHintValidatorTest, NullFilteredIndexWithUnprovenFilter) {
   for (const char* sql : {
-           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE k1 = @p1",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE k1 = 1",
+           "SELECT k1 FROM (SELECT k1, UPPER(col1) AS col1 "
+           "FROM T1@{force_index=NF_I1}) WHERE col1 IS NOT NULL",
            "SELECT k1 FROM T1@{force_index=NF_I1} "
            "WHERE col1 IS NOT NULL OR k1 = 1",
            "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 != @p",
@@ -248,7 +260,13 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithInUnnest) {
            "WHERE col1 IN UNNEST(['a', 'b'])",
            "SELECT k2 FROM T2 JOIN T1@{force_index=NF_I1} ON k1 = k2 "
            "WHERE col1 IN UNNEST(@ps)",
+           "SELECT k2 FROM T2 LEFT JOIN T1@{force_index=NF_I1} ON k1 = k2 "
+           "WHERE col1 IN UNNEST(@ps)",
+           "SELECT k1 FROM (SELECT k1, col1 FROM T1@{force_index=NF_I1}) "
+           "WHERE col1 IN UNNEST(@ps)",
            "DELETE FROM T1@{force_index=NF_I1} WHERE col1 IN UNNEST(@ps)",
+           "UPDATE T1@{force_index=NF_I1} SET col1 = 'x' "
+           "WHERE col1 IN UNNEST(@ps)",
        }) {
     SCOPED_TRACE(sql);
     auto output = AnalyzeQuery(sql);

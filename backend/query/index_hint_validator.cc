@@ -87,7 +87,9 @@ bool HasGeneratedEmulatorName(const Index* index) {
 struct ColumnFilter {
   // A filter rejects rows where the column is NULL in a form that Cloud
   // Spanner recognizes: `col IS NOT NULL`, or `col = @param` or
-  // `col = <non-null literal>`.
+  // `col = <non-null literal>`. The Cloud Spanner docs accept
+  // `col = <literal>`. `col = @param` also rejects NULL rows when the
+  // parameter is NULL, because the comparison is then NULL.
   bool not_null = false;
   // A filter is `col IN UNNEST(...)`. Cloud Spanner does not recognize it as
   // a filter that rejects NULLs.
@@ -260,6 +262,10 @@ void IndexHintValidator::AddFilters(const googlesql::ResolvedScan* scan,
               &filters_map_[scan->GetAs<googlesql::ResolvedTableScan>()]);
   } else if (scan->Is<googlesql::ResolvedFilterScan>()) {
     AddFilters(scan->GetAs<googlesql::ResolvedFilterScan>()->input_scan(),
+               filter);
+  } else if (scan->Is<googlesql::ResolvedProjectScan>()) {
+    // Computed columns get new column ids, so only pass-through columns match.
+    AddFilters(scan->GetAs<googlesql::ResolvedProjectScan>()->input_scan(),
                filter);
   } else if (scan->Is<googlesql::ResolvedJoinScan>()) {
     const auto* join = scan->GetAs<googlesql::ResolvedJoinScan>();
