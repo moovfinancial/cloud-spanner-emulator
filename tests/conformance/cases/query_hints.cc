@@ -24,6 +24,7 @@
 #include "googlesql/base/testing/status_matchers.h"
 #include "tests/common/proto_matchers.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "tests/conformance/common/database_test_base.h"
 
 namespace google {
@@ -311,15 +312,26 @@ TEST_P(QueryHintsTest, DisableNullFilteredIndexCheckForValidQuery) {
   GOOGLESQL_EXPECT_OK(Query(modified_valid_query));
 }
 
-TEST_P(QueryHintsTest, NullFilteredIndexWithEquality) {
+TEST_P(QueryHintsTest, NullFilteredIndexWithComparison) {
   if (dialect_ == database_api::DatabaseDialect::POSTGRESQL) {
     GTEST_SKIP() << "PostgreSQL ignores the index hint instead of failing";
   }
 
-  GOOGLESQL_EXPECT_OK(
-      QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "
-                      "WHERE Age = @age",
-                      {{"age", cloud::spanner::Value(int64_t{1})}}));
+  for (const char* where : {
+           "Age = @age",
+           "Age != @age",
+           "Age < @age",
+           "Age >= @age",
+           "@age > Age",
+           "Age BETWEEN @age AND 100",
+           "Age IN (@age, 2)",
+       }) {
+    SCOPED_TRACE(where);
+    GOOGLESQL_EXPECT_OK(QueryWithParams(
+        absl::StrCat("SELECT ID FROM Users@{force_index=UsersByAge} WHERE ",
+                     where),
+        {{"age", cloud::spanner::Value(int64_t{1})}}));
+  }
 }
 
 TEST_P(QueryHintsTest, NullFilteredIndexWithInUnnest) {

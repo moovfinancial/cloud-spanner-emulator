@@ -83,17 +83,18 @@ bool HasGeneratedEmulatorName(const Index* index) {
                               .value();
 }
 
-// What the filters of a table scan prove about one of its columns.
+// What the filters of a table scan prove about one of its columns. The forms
+// match what Cloud Spanner accepted in PLAN mode for a forced NULL_FILTERED
+// index.
 struct ColumnFilter {
-  // A filter rejects rows where the column is NULL in a form that Cloud
-  // Spanner recognizes: `col IS NOT NULL`, or `col = @param` or
-  // `col = <non-null literal>`. The Cloud Spanner docs accept
-  // `col = <literal>`. `col = @param` also rejects NULL rows when the
-  // parameter is NULL, because the comparison is then NULL.
+  // A filter rejects rows where the column is NULL: `col IS NOT NULL`, a
+  // comparison (=, !=, <, <=, >, >=) with the column as one operand, or
+  // `col BETWEEN ...` or `col IN (...)`. The other operands can be any
+  // expression, because a comparison with a NULL column is never true.
   bool not_null = false;
-  // A filter is `col IN UNNEST(...)`. Cloud Spanner does not recognize it as
+  // A filter is `col IN UNNEST(@param)`. Cloud Spanner does not accept it as
   // a filter that rejects NULLs.
-  bool in_unnest = false;
+  bool in_unnest_param = false;
 };
 
 bool IsColumn(const googlesql::ResolvedExpr* expr,
@@ -102,10 +103,10 @@ bool IsColumn(const googlesql::ResolvedExpr* expr,
          expr->GetAs<googlesql::ResolvedColumnRef>()->column() == column;
 }
 
-bool IsNonNullConstant(const googlesql::ResolvedExpr* expr) {
-  return expr->Is<googlesql::ResolvedParameter>() ||
-         (expr->Is<googlesql::ResolvedLiteral>() &&
-          !expr->GetAs<googlesql::ResolvedLiteral>()->value().is_null());
+bool IsComparison(absl::string_view name) {
+  return name == "$equal" || name == "$not_equal" || name == "$less" ||
+         name == "$less_or_equal" || name == "$greater" ||
+         name == "$greater_or_equal";
 }
 
 ColumnFilter FilterOn(
@@ -127,15 +128,20 @@ ColumnFilter FilterOn(
       const auto* call = filter->GetAs<googlesql::ResolvedFunctionCall>();
       const std::string& name = call->function()->Name();
       const auto& args = call->argument_list();
-      if (name == "$equal" && args.size() == 2 &&
-          ((IsColumn(args[0].get(), column) &&
-            IsNonNullConstant(args[1].get())) ||
-           (IsColumn(args[1].get(), column) &&
-            IsNonNullConstant(args[0].get())))) {
+      if (args.empty()) {
+        continue;
+      }
+      if (IsComparison(name) && args.size() == 2 &&
+          (IsColumn(args[0].get(), column) ||
+           IsColumn(args[1].get(), column))) {
         result.not_null = true;
-      } else if (name == "$in_array" && !args.empty() &&
+      } else if ((name == "$between" || name == "$in") &&
                  IsColumn(args[0].get(), column)) {
-        result.in_unnest = true;
+        result.not_null = true;
+      } else if (name == "$in_array" && args.size() == 2 &&
+                 IsColumn(args[0].get(), column) &&
+                 args[1]->Is<googlesql::ResolvedParameter>()) {
+        result.in_unnest_param = true;
       }
     }
   }
@@ -232,7 +238,7 @@ absl::Status IndexHintValidator::ValidateIndexesForTables() {
         ColumnFilter filter =
             FilterOn(table_scan, source_column->Name(), filters);
         // Cloud Spanner rejects this form, so the check cannot be disabled.
-        if (filter.in_unnest && !filter.not_null) {
+        if (filter.in_unnest_param && !filter.not_null) {
           return error::NullFilteredIndexUnusableForInUnnest(
               index_name, source_column->Name());
         }

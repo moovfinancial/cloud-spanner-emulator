@@ -58,7 +58,8 @@ class IndexHintValidatorTest : public testing::Test {
                                           R"(
       CREATE TABLE T1 (
         k1 INT64,
-        col1 STRING(MAX)
+        col1 STRING(MAX),
+        gcol STRING(MAX) AS (IF(col1 = 'a', col1, NULL)) STORED
       ) PRIMARY KEY (k1))",
                                           R"(
       CREATE TABLE T2 (
@@ -76,6 +77,8 @@ class IndexHintValidatorTest : public testing::Test {
       CREATE INDEX I2 ON T2(col2))",
                                           R"(
       CREATE NULL_FILTERED INDEX NF_I1 ON T1(col1))",
+                                          R"(
+      CREATE NULL_FILTERED INDEX NF_G ON T1(gcol))",
                                           R"(
       CREATE NULL_FILTERED INDEX I3 ON T3(col3))",
                                           R"(
@@ -175,12 +178,12 @@ TEST_F(IndexHintValidatorTest,
 }
 
 TEST_F(IndexHintValidatorTest, DisableNullFilteredIndexCheck) {
-  // The emulator does not treat `col1 IN ('a', 'b')` as a filter that rejects
-  // NULLs, because it is not confirmed that Cloud Spanner does. This is an
-  // emulator limitation, so the hint bypasses it.
+  // Cloud Spanner accepts `UPPER(col1) = 'A'` as a filter that rejects NULLs,
+  // but the emulator does not inspect function calls on the column. This is
+  // an emulator limitation, so the hint bypasses it.
   auto stmt1 = AnalyzeQuery(
       "SELECT col1 FROM T1@{force_index=NF_I1} "
-      "WHERE col1 IN ('a', 'b')");
+      "WHERE UPPER(col1) = 'A'");
   // Statement is rejected without the disabling index hint.
   {
     IndexHintValidator validator{schema()};
@@ -193,7 +196,7 @@ TEST_F(IndexHintValidatorTest, DisableNullFilteredIndexCheck) {
       "SELECT col1 FROM T1"
       "@{force_index=NF_I1, "
       "spanner_emulator.disable_query_null_filtered_index_check=true} "
-      "WHERE col1 IN ('a', 'b')");
+      "WHERE UPPER(col1) = 'A'");
   {
     IndexHintValidator validator{schema(),
                                  /*disable_null_filtered_index_check=*/true};
@@ -216,7 +219,9 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithIsNotNull) {
   }
 }
 
-TEST_F(IndexHintValidatorTest, NullFilteredIndexWithEquality) {
+// Each form was accepted by Cloud Spanner in PLAN mode for a forced
+// NULL_FILTERED index.
+TEST_F(IndexHintValidatorTest, NullFilteredIndexWithComparison) {
   for (const char* sql : {
            "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 = @p",
            "SELECT k1 FROM T1@{force_index=NF_I1} WHERE @p = col1",
@@ -225,6 +230,22 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithEquality) {
            "WHERE k1 > 0 AND col1 = @p",
            "SELECT k1 FROM T1@{force_index=NF_I1} "
            "WHERE col1 = @p AND col1 IN UNNEST(@ps)",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 != @p",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 < @p",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 <= 'a'",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 > UPPER(@p)",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE @p >= col1",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 = CAST(k1 AS "
+           "STRING)",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 BETWEEN @p AND "
+           "'z'",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IN ('a', 'b')",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IN (@p, 'a')",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 > @p AND col1 IN UNNEST(@ps)",
+           "SELECT k1 FROM T1@{force_index=NF_G} WHERE gcol = @p",
+           "SELECT k1 FROM T1@{force_index=NF_G} WHERE gcol IN ('a', 'b')",
+           "DELETE FROM T1@{force_index=NF_I1} WHERE col1 < @p",
        }) {
     SCOPED_TRACE(sql);
     auto output = AnalyzeQuery(sql);
@@ -240,8 +261,18 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithUnprovenFilter) {
            "FROM T1@{force_index=NF_I1}) WHERE col1 IS NOT NULL",
            "SELECT k1 FROM T1@{force_index=NF_I1} "
            "WHERE col1 IS NOT NULL OR k1 = 1",
-           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 != @p",
-           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IN (@p, 'a')",
+           // Cloud Spanner rejects these forms.
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IS NULL",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IS NOT DISTINCT FROM @p",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE IFNULL(col1, @p) = @p",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE (col1 = @p) IS TRUE",
+           // Cloud Spanner accepts these forms, but the emulator does not
+           // inspect them. The hint bypasses the check.
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE UPPER(col1) = 'A'",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE NOT (col1 = @p)",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST(['a', 'b'])",
        }) {
     SCOPED_TRACE(sql);
     auto output = AnalyzeQuery(sql);
@@ -256,8 +287,6 @@ TEST_F(IndexHintValidatorTest, NullFilteredIndexWithInUnnest) {
            "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IN UNNEST(@ps)",
            "SELECT k1 FROM T1@{force_index=NF_I1} "
            "WHERE k1 > 0 AND col1 IN UNNEST(@ps)",
-           "SELECT k1 FROM T1@{force_index=NF_I1} "
-           "WHERE col1 IN UNNEST(['a', 'b'])",
            "SELECT k2 FROM T2 JOIN T1@{force_index=NF_I1} ON k1 = k2 "
            "WHERE col1 IN UNNEST(@ps)",
            "SELECT k2 FROM T2 LEFT JOIN T1@{force_index=NF_I1} ON k1 = k2 "
