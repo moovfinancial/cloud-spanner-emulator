@@ -73,7 +73,7 @@ class IndexHintValidator : public googlesql::ResolvedASTVisitor {
       const googlesql::ResolvedFilterScan* scan) final;
 
   // Records the conjuncts of 'filter' as filters of each table scan that
-  // 'scan' reads through filters and joins.
+  // 'scan' reads through filters, projections, and joins.
   void AddFilters(const googlesql::ResolvedScan* scan,
                   const googlesql::ResolvedExpr* filter);
 
