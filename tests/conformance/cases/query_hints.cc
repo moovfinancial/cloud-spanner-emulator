@@ -14,7 +14,9 @@
 // limitations under the License.
 //
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "google/spanner/admin/database/v1/common.pb.h"
 #include "gmock/gmock.h"
@@ -305,17 +307,47 @@ TEST_P(QueryHintsTest, DisableNullFilteredIndexCheckForValidQuery) {
       "spanner_emulator.disable_query_null_filtered_index_check=true} "
       "WHERE Age IS NOT NULL";
 
-  // The query is accepted in prod but rejected by the Emulator as it currently
-  // cannot determine nullability from the predicate."
-  if (in_prod_env()) {
-    GOOGLESQL_EXPECT_OK(Query(valid_query));
-  } else {
-    EXPECT_THAT(Query(valid_query),
-                StatusIs(absl::StatusCode::kInvalidArgument));
+  GOOGLESQL_EXPECT_OK(Query(valid_query));
+  GOOGLESQL_EXPECT_OK(Query(modified_valid_query));
+}
+
+TEST_P(QueryHintsTest, NullFilteredIndexWithEquality) {
+  if (dialect_ == database_api::DatabaseDialect::POSTGRESQL) {
+    GTEST_SKIP() << "PostgreSQL ignores the index hint instead of failing";
   }
 
-  // With the hint to disable null-filtered checks, the emulator is pacified.
-  GOOGLESQL_EXPECT_OK(Query(modified_valid_query));
+  GOOGLESQL_EXPECT_OK(
+      QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "
+                      "WHERE Age = @age",
+                      {{"age", cloud::spanner::Value(int64_t{1})}}));
+}
+
+TEST_P(QueryHintsTest, NullFilteredIndexWithInUnnest) {
+  if (dialect_ == database_api::DatabaseDialect::POSTGRESQL) {
+    GTEST_SKIP() << "PostgreSQL ignores the index hint instead of failing";
+  }
+
+  cloud::spanner::SqlStatement::ParamType params = {
+      {"ages", cloud::spanner::Value(std::vector<int64_t>{1, 2})}};
+
+  // Cloud Spanner cannot prove that IN UNNEST rejects NULLs. The hint to
+  // disable the null-filtered index check does not change that.
+  EXPECT_THAT(QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "
+                              "WHERE Age IN UNNEST(@ages)",
+                              params),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      QueryWithParams(
+          "SELECT ID FROM Users@{force_index=UsersByAge, "
+          "spanner_emulator.disable_query_null_filtered_index_check=true} "
+          "WHERE Age IN UNNEST(@ages)",
+          params),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+
+  GOOGLESQL_EXPECT_OK(
+      QueryWithParams("SELECT ID FROM Users@{force_index=UsersByAge} "
+                      "WHERE Age IS NOT NULL AND Age IN UNNEST(@ages)",
+                      params));
 }
 
 TEST_P(QueryHintsTest, DisableNullFilteredIndexAtStatementLevel) {

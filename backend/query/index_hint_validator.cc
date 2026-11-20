@@ -21,14 +21,17 @@
 #include <string>
 #include <vector>
 
+#include "googlesql/public/function.h"
 #include "googlesql/public/value.h"
 #include "googlesql/resolved_ast/resolved_ast.h"
+#include "googlesql/resolved_ast/resolved_column.h"
 #include "googlesql/resolved_ast/resolved_node.h"
 #include "googlesql/resolved_ast/resolved_node_kind.pb.h"
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "backend/query/null_predicates.h"
 #include "backend/query/queryable_table.h"
 #include "backend/schema/catalog/column.h"
 #include "backend/schema/catalog/index.h"
@@ -78,6 +81,63 @@ bool HasGeneratedEmulatorName(const Index* index) {
                               index->indexed_table()->Name(), column_names,
                               index->is_null_filtered(), index->is_unique())
                               .value();
+}
+
+// What the filters of a table scan prove about one of its columns.
+struct ColumnFilter {
+  // A filter rejects rows where the column is NULL in a form that Cloud
+  // Spanner recognizes: `col IS NOT NULL`, or `col = @param` or
+  // `col = <non-null literal>`.
+  bool not_null = false;
+  // A filter is `col IN UNNEST(...)`. Cloud Spanner does not recognize it as
+  // a filter that rejects NULLs.
+  bool in_unnest = false;
+};
+
+bool IsColumn(const googlesql::ResolvedExpr* expr,
+              const googlesql::ResolvedColumn& column) {
+  return expr->Is<googlesql::ResolvedColumnRef>() &&
+         expr->GetAs<googlesql::ResolvedColumnRef>()->column() == column;
+}
+
+bool IsNonNullConstant(const googlesql::ResolvedExpr* expr) {
+  return expr->Is<googlesql::ResolvedParameter>() ||
+         (expr->Is<googlesql::ResolvedLiteral>() &&
+          !expr->GetAs<googlesql::ResolvedLiteral>()->value().is_null());
+}
+
+ColumnFilter FilterOn(
+    const googlesql::ResolvedTableScan* scan, absl::string_view column_name,
+    const std::vector<const googlesql::ResolvedExpr*>& filters) {
+  ColumnFilter result;
+  for (const googlesql::ResolvedColumn& column : scan->column_list()) {
+    if (!absl::EqualsIgnoreCase(column.name(), column_name)) {
+      continue;
+    }
+    for (const googlesql::ResolvedExpr* filter : filters) {
+      if (const auto* not_null = IsNotNullColumn(filter)) {
+        result.not_null = result.not_null || *not_null == column;
+        continue;
+      }
+      if (!filter->Is<googlesql::ResolvedFunctionCall>()) {
+        continue;
+      }
+      const auto* call = filter->GetAs<googlesql::ResolvedFunctionCall>();
+      const std::string& name = call->function()->Name();
+      const auto& args = call->argument_list();
+      if (name == "$equal" && args.size() == 2 &&
+          ((IsColumn(args[0].get(), column) &&
+            IsNonNullConstant(args[1].get())) ||
+           (IsColumn(args[1].get(), column) &&
+            IsNonNullConstant(args[0].get())))) {
+        result.not_null = true;
+      } else if (name == "$in_array" && !args.empty() &&
+                 IsColumn(args[0].get(), column)) {
+        result.in_unnest = true;
+      }
+    }
+  }
+  return result;
 }
 
 }  // namespace
@@ -154,20 +214,58 @@ absl::Status IndexHintValidator::ValidateIndexesForTables() {
             "queries");
       }
     }
-    if (index->is_null_filtered() && !disable_null_filtered_index_check_) {
+    if (index->is_null_filtered()) {
+      // If any of the index's columns are nullable, then it is not indexing
+      // the full table. The index can only be used if the query's filters
+      // reject NULLs in each of those columns.
+      const std::vector<const googlesql::ResolvedExpr*> no_filters;
+      auto it = filters_map_.find(table_scan);
+      const auto& filters = it == filters_map_.end() ? no_filters : it->second;
+      bool unproven = false;
       for (const auto* key_column : index->key_columns()) {
         const auto* source_column = key_column->column()->source_column();
-        // If any of the index's columns are nullable, then it is not indexing
-        // the full table and therefore, without analyzing the predicates in
-        // the query to determine if they filter nulls, we cannot allow the
-        // index to be used.
-        if (source_column->is_nullable()) {
-          return error::NullFilteredIndexUnusable(index_name);
+        if (!source_column->is_nullable()) {
+          continue;
         }
+        ColumnFilter filter =
+            FilterOn(table_scan, source_column->Name(), filters);
+        // Cloud Spanner rejects this form, so the check cannot be disabled.
+        if (filter.in_unnest && !filter.not_null) {
+          return error::NullFilteredIndexUnusableForInUnnest(
+              index_name, source_column->Name());
+        }
+        unproven = unproven || !filter.not_null;
+      }
+      if (unproven && !disable_null_filtered_index_check_) {
+        return error::NullFilteredIndexUnusable(index_name);
       }
     }
   }
   return absl::OkStatus();
+}
+
+absl::Status IndexHintValidator::VisitResolvedFilterScan(
+    const googlesql::ResolvedFilterScan* scan) {
+  AddFilters(scan->input_scan(), scan->filter_expr());
+  return googlesql::ResolvedASTVisitor::DefaultVisit(scan);
+}
+
+void IndexHintValidator::AddFilters(const googlesql::ResolvedScan* scan,
+                                    const googlesql::ResolvedExpr* filter) {
+  if (scan == nullptr || filter == nullptr) {
+    return;
+  }
+  if (scan->Is<googlesql::ResolvedTableScan>()) {
+    Conjuncts(filter,
+              &filters_map_[scan->GetAs<googlesql::ResolvedTableScan>()]);
+  } else if (scan->Is<googlesql::ResolvedFilterScan>()) {
+    AddFilters(scan->GetAs<googlesql::ResolvedFilterScan>()->input_scan(),
+               filter);
+  } else if (scan->Is<googlesql::ResolvedJoinScan>()) {
+    const auto* join = scan->GetAs<googlesql::ResolvedJoinScan>();
+    AddFilters(join->left_scan(), filter);
+    AddFilters(join->right_scan(), filter);
+  }
 }
 
 absl::Status IndexHintValidator::VisitResolvedQueryStmt(
@@ -189,6 +287,7 @@ absl::Status IndexHintValidator::VisitResolvedInsertStmt(
 
 absl::Status IndexHintValidator::VisitResolvedUpdateStmt(
     const googlesql::ResolvedUpdateStmt* stmt) {
+  AddFilters(stmt->table_scan(), stmt->where_expr());
   // Visit children first to collect all hints.
   GOOGLESQL_RETURN_IF_ERROR(googlesql::ResolvedASTVisitor::DefaultVisit(stmt));
   return ValidateIndexesForTables();
@@ -196,6 +295,7 @@ absl::Status IndexHintValidator::VisitResolvedUpdateStmt(
 
 absl::Status IndexHintValidator::VisitResolvedDeleteStmt(
     const googlesql::ResolvedDeleteStmt* stmt) {
+  AddFilters(stmt->table_scan(), stmt->where_expr());
   // Visit children first to collect all hints.
   GOOGLESQL_RETURN_IF_ERROR(googlesql::ResolvedASTVisitor::DefaultVisit(stmt));
   return ValidateIndexesForTables();

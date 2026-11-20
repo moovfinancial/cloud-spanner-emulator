@@ -17,6 +17,9 @@
 #ifndef THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_INDEX_HINT_VALIDATOR_H_
 #define THIRD_PARTY_CLOUD_SPANNER_EMULATOR_BACKEND_QUERY_INDEX_HINT_VALIDATOR_H_
 
+#include <string>
+#include <vector>
+
 #include "googlesql/resolved_ast/resolved_ast.h"
 #include "googlesql/resolved_ast/resolved_ast_visitor.h"
 #include "googlesql/resolved_ast/resolved_node_kind.pb.h"
@@ -65,9 +68,23 @@ class IndexHintValidator : public googlesql::ResolvedASTVisitor {
   absl::Status VisitResolvedTableScan(
       const googlesql::ResolvedTableScan* scan) final;
 
+  // To collect the filters that apply to each table scan.
+  absl::Status VisitResolvedFilterScan(
+      const googlesql::ResolvedFilterScan* scan) final;
+
+  // Records the conjuncts of 'filter' as filters of each table scan that
+  // 'scan' reads through filters and joins.
+  void AddFilters(const googlesql::ResolvedScan* scan,
+                  const googlesql::ResolvedExpr* filter);
+
   // Mapping of table scans to the index hints specified on each.
   absl::flat_hash_map<const googlesql::ResolvedTableScan*, std::string>
       index_hints_map_;
+
+  // Mapping of table scans to the conjuncts that filter their rows.
+  absl::flat_hash_map<const googlesql::ResolvedTableScan*,
+                      std::vector<const googlesql::ResolvedExpr*>>
+      filters_map_;
 
   // The database schema.
   const Schema* schema_;

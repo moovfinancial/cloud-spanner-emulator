@@ -317,6 +317,7 @@ cc_library(
     srcs = ["join_lookup_rewriter.cc"],
     hdrs = ["join_lookup_rewriter.h"],
     deps = [
+        ":null_predicates",
         ":queryable_column",
         ":queryable_table",
         "//backend/schema/catalog:schema",
@@ -324,6 +325,16 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_googlesql//googlesql/base:status",
         "@com_google_googlesql//googlesql/public:type",
+        "@com_google_googlesql//googlesql/resolved_ast",
+    ],
+)
+
+cc_library(
+    name = "null_predicates",
+    srcs = ["null_predicates.cc"],
+    hdrs = ["null_predicates.h"],
+    deps = [
+        "@com_google_googlesql//googlesql/public:function",
         "@com_google_googlesql//googlesql/resolved_ast",
     ],
 )
@@ -379,6 +390,7 @@ cc_library(
     hdrs = ["ann_validator.h"],
     deps = [
         ":ann_functions_rewriter",
+        ":null_predicates",
         "//backend/schema/catalog:schema",
         "//backend/schema/ddl:operations_cc_proto",
         "//common:errors",
@@ -949,6 +961,7 @@ cc_library(
     srcs = ["index_hint_validator.cc"],
     hdrs = ["index_hint_validator.h"],
     deps = [
+        ":null_predicates",
         ":queryable_table",
         "//backend/schema/catalog:schema",
         "//backend/schema/updater:global_schema_names",
@@ -957,6 +970,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_googlesql//googlesql/base:ret_check",
+        "@com_google_googlesql//googlesql/public:function",
         "@com_google_googlesql//googlesql/public:value",
         "@com_google_googlesql//googlesql/resolved_ast",
         "@com_google_googlesql//googlesql/resolved_ast:resolved_node_kind_cc_proto",
@@ -984,6 +998,7 @@ cc_test(
         "@com_google_googlesql//googlesql/base/testing:status_matchers",
         "@com_google_googlesql//googlesql/public:analyzer",
         "@com_google_googlesql//googlesql/public:analyzer_options",
+        "@com_google_googlesql//googlesql/public:type",
         "@com_google_googletest//:gtest_main",
     ],
 )

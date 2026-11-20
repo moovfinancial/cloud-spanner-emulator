@@ -21,6 +21,7 @@
 
 #include "googlesql/public/analyzer.h"
 #include "googlesql/public/analyzer_options.h"
+#include "googlesql/public/types/type_factory.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
@@ -47,6 +48,11 @@ class IndexHintValidatorTest : public testing::Test {
       : analyzer_options_(MakeGoogleSqlAnalyzerOptions(kDefaultTimeZone)) {}
 
   void SetUp() override {
+    GOOGLESQL_ASSERT_OK(analyzer_options_.AddQueryParameter(
+        "p", googlesql::types::StringType()));
+    GOOGLESQL_ASSERT_OK(analyzer_options_.AddQueryParameter(
+        "ps", googlesql::types::StringArrayType()));
+
     GOOGLESQL_ASSERT_OK_AND_ASSIGN(schema_, test::CreateSchemaFromDDL(
                                       {
                                           R"(
@@ -98,7 +104,7 @@ class IndexHintValidatorTest : public testing::Test {
  private:
   googlesql::TypeFactory type_factory_;
 
-  const googlesql::AnalyzerOptions analyzer_options_;
+  googlesql::AnalyzerOptions analyzer_options_;
 
   std::unique_ptr<const FunctionCatalog> fn_catalog_;
 
@@ -169,9 +175,10 @@ TEST_F(IndexHintValidatorTest,
 }
 
 TEST_F(IndexHintValidatorTest, DisableNullFilteredIndexCheck) {
+  // The emulator cannot prove that `col1 IN ('a', 'b')` rejects NULLs.
   auto stmt1 = AnalyzeQuery(
       "SELECT col1 FROM T1@{force_index=NF_I1} "
-      "WHERE col1 IS NOT NULL");
+      "WHERE col1 IN ('a', 'b')");
   // Statement is rejected without the disabling index hint.
   {
     IndexHintValidator validator{schema()};
@@ -184,12 +191,92 @@ TEST_F(IndexHintValidatorTest, DisableNullFilteredIndexCheck) {
       "SELECT col1 FROM T1"
       "@{force_index=NF_I1, "
       "spanner_emulator.disable_query_null_filtered_index_check=true} "
-      "WHERE col1 IS NOT NULL");
+      "WHERE col1 IN ('a', 'b')");
   {
     IndexHintValidator validator{schema(),
                                  /*disable_null_filtered_index_check=*/true};
     GOOGLESQL_EXPECT_OK(stmt2->resolved_statement()->Accept(&validator));
   }
+}
+
+TEST_F(IndexHintValidatorTest, NullFilteredIndexWithIsNotNull) {
+  auto output = AnalyzeQuery(
+      "SELECT col1 FROM T1@{force_index=NF_I1} WHERE col1 IS NOT NULL");
+  IndexHintValidator validator{schema()};
+  GOOGLESQL_EXPECT_OK(output->resolved_statement()->Accept(&validator));
+}
+
+TEST_F(IndexHintValidatorTest, NullFilteredIndexWithEquality) {
+  for (const char* sql : {
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 = @p",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE @p = col1",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 = 'a'",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE k1 > 0 AND col1 = @p",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 = @p AND col1 IN UNNEST(@ps)",
+       }) {
+    SCOPED_TRACE(sql);
+    auto output = AnalyzeQuery(sql);
+    IndexHintValidator validator{schema()};
+    GOOGLESQL_EXPECT_OK(output->resolved_statement()->Accept(&validator));
+  }
+}
+
+TEST_F(IndexHintValidatorTest, NullFilteredIndexWithUnprovenFilter) {
+  for (const char* sql : {
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE k1 = @p1",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IS NOT NULL OR k1 = 1",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 != @p",
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IN (@p, 'a')",
+       }) {
+    SCOPED_TRACE(sql);
+    auto output = AnalyzeQuery(sql);
+    IndexHintValidator validator{schema()};
+    EXPECT_EQ(output->resolved_statement()->Accept(&validator),
+              error::NullFilteredIndexUnusable("NF_I1"));
+  }
+}
+
+TEST_F(IndexHintValidatorTest, NullFilteredIndexWithInUnnest) {
+  for (const char* sql : {
+           "SELECT k1 FROM T1@{force_index=NF_I1} WHERE col1 IN UNNEST(@ps)",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE k1 > 0 AND col1 IN UNNEST(@ps)",
+           "SELECT k1 FROM T1@{force_index=NF_I1} "
+           "WHERE col1 IN UNNEST(['a', 'b'])",
+           "SELECT k2 FROM T2 JOIN T1@{force_index=NF_I1} ON k1 = k2 "
+           "WHERE col1 IN UNNEST(@ps)",
+           "DELETE FROM T1@{force_index=NF_I1} WHERE col1 IN UNNEST(@ps)",
+       }) {
+    SCOPED_TRACE(sql);
+    auto output = AnalyzeQuery(sql);
+    // The hint to disable the null-filtered index check does not apply,
+    // because Cloud Spanner rejects these queries.
+    for (bool disable : {false, true}) {
+      IndexHintValidator validator{schema(),
+                                   /*disable_null_filtered_index_check=*/
+                                   disable};
+      EXPECT_EQ(output->resolved_statement()->Accept(&validator),
+                error::NullFilteredIndexUnusableForInUnnest("NF_I1", "col1"));
+    }
+  }
+}
+
+TEST_F(IndexHintValidatorTest, NullFilteredIndexWithInUnnestAndIsNotNull) {
+  auto output = AnalyzeQuery(
+      "SELECT k1 FROM T1@{force_index=NF_I1} "
+      "WHERE col1 IS NOT NULL AND col1 IN UNNEST(@ps)");
+  IndexHintValidator validator{schema()};
+  GOOGLESQL_EXPECT_OK(output->resolved_statement()->Accept(&validator));
+}
+
+TEST_F(IndexHintValidatorTest, InUnnestOnIndexWithoutNullFiltering) {
+  auto output = AnalyzeQuery(
+      "SELECT k1 FROM T1@{force_index=I1} WHERE col1 IN UNNEST(@ps)");
+  IndexHintValidator validator{schema()};
+  GOOGLESQL_EXPECT_OK(output->resolved_statement()->Accept(&validator));
 }
 
 TEST_F(IndexHintValidatorTest,

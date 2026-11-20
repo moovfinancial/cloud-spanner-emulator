@@ -774,6 +774,8 @@ absl::Status QueryHintIndexNotFound(absl::string_view table_name,
                                     absl::string_view index_name);
 absl::Status QueryHintManagedIndexNotSupported(absl::string_view index_name);
 absl::Status NullFilteredIndexUnusable(absl::string_view index_name);
+absl::Status NullFilteredIndexUnusableForInUnnest(
+    absl::string_view index_name, absl::string_view column_name);
 absl::Status NonPartitionableQuery(absl::string_view reason);
 absl::Status EmulatorDoesNotSupportQueryPlans();
 absl::Status InvalidStatementHintValue(absl::string_view hint_string,
